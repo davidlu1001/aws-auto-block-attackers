@@ -1,0 +1,77 @@
+# AWS Auto Block Attackers - Cron Configuration Examples
+# Add to crontab with: crontab -e (for root) or sudo crontab -e
+
+# -------------------------------------------------------------------
+# RECOMMENDED: Run every 15 minutes
+# -------------------------------------------------------------------
+*/15 * * * * /usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py --lb-name-pattern "alb-prod-*" --region ap-southeast-2 --threshold 75 --lookback 90m --live-run >> /var/log/auto-block-attackers.log 2>&1
+
+# -------------------------------------------------------------------
+# ALTERNATIVE SCHEDULES
+# -------------------------------------------------------------------
+
+# Run every 30 minutes (less aggressive)
+# */30 * * * * /usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py --lb-name-pattern "alb-*" --threshold 100 --lookback 2h --live-run >> /var/log/auto-block-attackers.log 2>&1
+
+# Run hourly at minute 5 (for high-traffic sites)
+# 5 * * * * /usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py --lb-name-pattern "alb-*" --threshold 150 --lookback 3h --live-run >> /var/log/auto-block-attackers.log 2>&1
+
+# Run every 10 minutes with lower threshold (more aggressive)
+# */10 * * * * /usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py --lb-name-pattern "alb-*" --threshold 50 --lookback 60m --live-run >> /var/log/auto-block-attackers.log 2>&1
+
+# -------------------------------------------------------------------
+# DEBUG MODE (for troubleshooting)
+# -------------------------------------------------------------------
+
+# Run every 30 minutes with debug logging
+# */30 * * * * /usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py --lb-name-pattern "alb-*" --threshold 50 --lookback 1h --debug --live-run >> /var/log/auto-block-attackers-debug.log 2>&1
+
+# -------------------------------------------------------------------
+# DRY RUN MODE (for testing without making changes)
+# -------------------------------------------------------------------
+
+# Run every hour in dry-run mode to test configuration
+# 0 * * * * /usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py --lb-name-pattern "alb-*" --threshold 50 --lookback 2h >> /var/log/auto-block-attackers-dryrun.log 2>&1
+
+# -------------------------------------------------------------------
+# ENVIRONMENT VARIABLES
+# -------------------------------------------------------------------
+
+# If you need to set environment variables, add them before the command:
+# */15 * * * * SLACK_BOT_TOKEN=xoxb-xxx SLACK_CHANNEL=C04XXX /usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py --live-run >> /var/log/auto-block-attackers.log 2>&1
+
+# Or source an environment file:
+# */15 * * * * . /opt/aws-auto-block-attackers/.env && /usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py --live-run >> /var/log/auto-block-attackers.log 2>&1
+
+# -------------------------------------------------------------------
+# LOG ROTATION SETUP
+# -------------------------------------------------------------------
+# Create /etc/logrotate.d/aws-auto-block-attackers with the following content:
+
+# /var/log/auto-block-attackers.log {
+#     daily
+#     rotate 14
+#     compress
+#     delaycompress
+#     missingok
+#     notifempty
+#     create 0644 root root
+#     sharedscripts
+#     postrotate
+#         # Optional: Send notification after log rotation
+#         # curl -X POST -H 'Content-type: application/json' --data '{"text":"Rotated auto-block-attackers logs"}' YOUR_WEBHOOK_URL
+#     endscript
+# }
+
+# -------------------------------------------------------------------
+# MONITORING AND ALERTING
+# -------------------------------------------------------------------
+
+# Optional: Daily summary report at 9 AM
+# 0 9 * * * tail -100 /var/log/auto-block-attackers.log | grep "ACTIVE BLOCK" | mail -s "Daily Blocked IPs Report" admin@example.com
+
+# Optional: Alert if script fails (check for ERROR in logs)
+# */15 * * * * if grep -q "ERROR" /var/log/auto-block-attackers.log; then echo "Auto-block script errors detected" | mail -s "ALERT: Auto-block errors" admin@example.com; fi
+
+# Example using @reboot:
+# @reboot sleep 60 && /usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py --live-run >> /var/log/auto-block-attackers.log 2>&1

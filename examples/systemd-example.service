@@ -1,0 +1,63 @@
+[Unit]
+Description=AWS Auto Block Attackers - Automated IP Blocking
+Documentation=https://github.com/davidlu1001/aws-auto-block-attackers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+# Working directory where the script is installed
+WorkingDirectory=/opt/aws-auto-block-attackers
+
+# Environment variables (alternatively use EnvironmentFile)
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/opt/aws-auto-block-attackers"
+
+# Load environment variables from file (optional)
+# Contains SLACK_BOT_TOKEN, SLACK_CHANNEL, IPINFO_TOKEN, AWS credentials
+EnvironmentFile=-/opt/aws-auto-block-attackers/.env
+
+# Main execution command
+ExecStart=/usr/bin/python3 /opt/aws-auto-block-attackers/auto_block_attackers.py \
+    --lb-name-pattern "alb-prod-*" \
+    --region ap-southeast-2 \
+    --lookback 90m \
+    --threshold 75 \
+    --start-rule 80 \
+    --limit 20 \
+    --whitelist-file ./whitelist.txt \
+    --aws-ip-ranges-file /opt/aws-auto-block-attackers/ip-ranges.json \
+    --registry-file ./block_registry.json \
+    --live-run
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aws-auto-block-attackers
+
+# Restart policy (don't restart on failure for oneshot)
+Restart=no
+
+# Timeout (kill if running longer than 10 minutes)
+TimeoutStartSec=600
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sre-scripts/security
+ReadWritePaths=/opt/aws-auto-block-attackers
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+
+# Nice level (lower priority)
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

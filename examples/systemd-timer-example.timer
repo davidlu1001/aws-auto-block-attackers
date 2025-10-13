@@ -1,0 +1,58 @@
+[Unit]
+Description=Run AWS Auto Block Attackers every 15 minutes
+Documentation=https://github.com/davidlu1001/aws-auto-block-attackers
+Requires=aws-auto-block-attackers.service
+
+[Timer]
+# Run every 15 minutes
+OnCalendar=*:0/15
+
+# Alternative schedules (comment out the OnCalendar above and uncomment one below):
+# Every 30 minutes:
+# OnCalendar=*:0/30
+#
+# Every hour at minute 5:
+# OnCalendar=*:05:00
+#
+# Every 2 hours:
+# OnCalendar=0/2:00:00
+#
+# Every day at 2 AM:
+# OnCalendar=02:00:00
+
+# Run 1 minute after system boot
+OnBootSec=1min
+
+# If system was off during scheduled time, run immediately on next boot
+Persistent=true
+
+# Randomize start time by up to 60 seconds to avoid thundering herd
+# RandomizedDelaySec=60
+
+# Unit activation state
+Unit=aws-auto-block-attackers.service
+
+[Install]
+WantedBy=timers.target
+
+# Installation instructions:
+# 1. Copy files to /etc/systemd/system/:
+#    sudo cp systemd-example.service /etc/systemd/system/aws-auto-block-attackers.service
+#    sudo cp systemd-timer-example.timer /etc/systemd/system/aws-auto-block-attackers.timer
+#
+# 2. Reload systemd:
+#    sudo systemctl daemon-reload
+#
+# 3. Enable and start the timer:
+#    sudo systemctl enable aws-auto-block-attackers.timer
+#    sudo systemctl start aws-auto-block-attackers.timer
+#
+# 4. Check timer status:
+#    sudo systemctl status aws-auto-block-attackers.timer
+#    sudo systemctl list-timers aws-auto-block-attackers.timer
+#
+# 5. View logs:
+#    sudo journalctl -u aws-auto-block-attackers.service -f
+#
+# 6. Manually trigger execution:
+#    sudo systemctl start aws-auto-block-attackers.service

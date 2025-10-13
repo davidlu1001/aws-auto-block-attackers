@@ -1,0 +1,20 @@
+# Whitelist Configuration
+# Lines starting with # are comments
+# Add one IP address per line
+# CIDR notation is NOT supported - use individual IPs only
+
+# Example: Corporate office IPs
+203.0.113.10
+203.0.113.11
+
+# Example: Known legitimate scanners
+198.51.100.50
+
+# Example: Internal monitoring systems
+192.0.2.100
+
+# Example: Partner/Vendor IPs
+198.51.100.75
+
+# Add your trusted IP addresses below:
+# YOUR_IP_HERE

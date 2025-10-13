@@ -1,0 +1,110 @@
+[project]
+name = "aws-auto-block-attackers"
+version = "1.0.0"
+description = "Automated AWS Network ACL management tool that analyzes ALB logs, detects malicious traffic, and implements tiered time-based IP blocking"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "AWS Auto Block Attackers Contributors", email = "security@yourorg.com"}
+]
+maintainers = [
+    {name = "AWS Auto Block Attackers Contributors", email = "security@yourorg.com"}
+]
+keywords = [
+    "aws",
+    "security",
+    "nacl",
+    "alb",
+    "firewall",
+    "attack-detection",
+    "ip-blocking",
+    "threat-intelligence",
+    "automation",
+    "devops"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Networking :: Firewalls",
+    "Topic :: System :: Systems Administration",
+    "Environment :: Console",
+]
+dependencies = [
+    "boto3>=1.28.0",
+    "botocore>=1.31.0",
+    "ipinfo>=4.4.3",
+    "requests>=2.32.0",
+    "slack-sdk>=3.21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.7.0",
+    "pylint>=2.17.0",
+    "mypy>=1.5.0",
+    "moto>=4.2.0",
+    "types-requests>=2.31.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/davidlu1001/aws-auto-block-attackers"
+Documentation = "https://github.com/davidlu1001/aws-auto-block-attackers#readme"
+Repository = "https://github.com/davidlu1001/aws-auto-block-attackers"
+Issues = "https://github.com/davidlu1001/aws-auto-block-attackers/issues"
+Changelog = "https://github.com/davidlu1001/aws-auto-block-attackers/releases"
+
+# Note: Script entry point removed - use: uv run python3 auto_block_attackers.py
+# [project.scripts]
+# auto-block-attackers = "auto_block_attackers:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = [
+    "auto_block_attackers.py",
+    "slack_client.py",
+]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "auto_block_attackers.py",
+    "slack_client.py",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+include = '\.pyi?$'
+
+[tool.pylint.messages_control]
+max-line-length = 100
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true

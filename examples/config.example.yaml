@@ -1,0 +1,133 @@
+# AWS Auto Block Attackers - Configuration Example
+# Copy this file to config.yaml and customize for your environment
+# Note: This is a reference example. The script currently uses command-line arguments.
+# Future versions may support loading configuration from this file.
+
+# AWS Configuration
+aws:
+  # AWS region where your resources are located
+  region: ap-southeast-2
+
+  # Load balancer name pattern (supports wildcards)
+  # Examples: "alb-*", "alb-prod-*", "alb-eodefault-*"
+  lb_name_pattern: "alb-*"
+
+# Scanning Configuration
+scanning:
+  # How far back to scan logs (format: 30m, 2h, 1d)
+  # Recommended: 60m for 15-minute cron jobs, 2h for hourly jobs
+  lookback: 60m
+
+  # Minimum malicious requests to trigger blocking
+  # Recommended: 50-100 for production (lower = more aggressive)
+  threshold: 50
+
+# NACL Configuration
+nacl:
+  # Starting rule number for managed DENY rules
+  # Must be between 1-99. Leave room for manual rules.
+  start_rule: 80
+
+  # Maximum number of DENY rules to manage
+  # With start_rule=80 and limit=20, uses rules 80-99
+  limit: 20
+
+# File Paths
+files:
+  # Whitelist file containing trusted IPs (one per line)
+  whitelist: whitelist.txt
+
+  # AWS IP ranges file (download from https://ip-ranges.amazonaws.com/ip-ranges.json)
+  # Used to exclude AWS service IPs from blocking
+  aws_ip_ranges: ip-ranges.json
+
+  # Block registry file for persistent time-based blocking
+  # Stores block metadata, tiers, and expiration times
+  registry: ./block_registry.json
+
+# Tier Configuration (optional - uses defaults if not specified)
+# Customize block durations and thresholds based on your threat model
+tiers:
+  - min_hits: 2000
+    duration_hours: 168  # 7 days
+    name: critical
+    priority: 4
+
+  - min_hits: 1000
+    duration_hours: 72   # 3 days
+    name: high
+    priority: 3
+
+  - min_hits: 500
+    duration_hours: 48   # 2 days
+    name: medium
+    priority: 2
+
+  - min_hits: 100
+    duration_hours: 24   # 1 day
+    name: low
+    priority: 1
+
+  - min_hits: 0
+    duration_hours: 1    # 1 hour (rolling)
+    name: minimal
+    priority: 0
+
+# Notifications
+notifications:
+  slack:
+    enabled: true
+    # Token and channel are read from environment variables:
+    # SLACK_BOT_TOKEN and SLACK_CHANNEL
+    # You can also specify them here (not recommended for security):
+    # token: xoxb-your-token-here
+    # channel: C04ABCDEFG
+
+  ipinfo:
+    enabled: true
+    # Token is read from environment variable: IPINFO_TOKEN
+    # You can also specify it here (not recommended for security):
+    # token: your-ipinfo-token
+
+# Attack Pattern Detection
+# Advanced users can customize attack patterns (requires code modification)
+patterns:
+  enabled_categories:
+    - lfi              # Local File Inclusion
+    - xss              # Cross-Site Scripting
+    - sqli             # SQL Injection
+    - command_injection
+    - sensitive_files
+    - scanner_detection
+    - ssti             # Server-Side Template Injection
+
+# Execution Mode
+execution:
+  # Dry run mode: analyze and report without making changes
+  dry_run: true
+
+  # Debug mode: verbose logging for troubleshooting
+  debug: false
+
+  # Parallel processing for log files
+  max_workers: 10
+
+# Performance Tuning
+performance:
+  # S3 pagination settings
+  s3_max_items_per_date: 10000
+
+  # Connection timeouts (seconds)
+  connect_timeout: 10
+  read_timeout: 15
+
+  # Retry settings
+  max_retry_attempts: 3
+
+  # IPInfo cache TTL (seconds)
+  ipinfo_cache_ttl: 3600
+
+# Maintenance
+maintenance:
+  # Remove registry entries older than this many days
+  registry_cleanup_days: 30

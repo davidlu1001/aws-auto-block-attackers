@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Tests](https://img.shields.io/badge/tests-159%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-197%20passing-brightgreen.svg)]()
 
 Automated AWS security tool that analyzes Application Load Balancer (ALB) access logs, detects malicious traffic patterns using multi-signal analysis, and implements tiered time-based IP blocking via Network ACLs (NACLs) and AWS WAF IP Sets.
 
@@ -13,6 +13,7 @@ Automated AWS security tool that analyzes Application Load Balancer (ALB) access
 - **IPv6 Support**: Full dual-stack blocking with separate rule ranges
 - **AWS WAF Integration**: Parallel blocking via WAF IP Sets for edge protection
 - **Multi-Signal Detection**: Reduces false positives by correlating multiple threat indicators
+- **O(log N) AWS IP Lookup**: Fast binary search for AWS IP exclusion with auto-download of ip-ranges.json
 - **Athena Integration**: SQL-based analysis for large-scale log processing
 - **Enhanced Slack Notifications**: Color-coded severity, threading, Block Kit formatting
 - **CloudWatch Metrics**: Built-in observability with custom namespace support

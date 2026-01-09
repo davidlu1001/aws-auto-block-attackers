@@ -237,11 +237,16 @@ python3 auto_block_attackers.py \
 
 ### `--aws-ip-ranges-file`
 
-**Description:** Path to AWS ip-ranges.json file for automatic AWS IP exclusion.
+**Description:** Path to AWS ip-ranges.json file for automatic AWS IP exclusion. By default, the file is automatically downloaded from AWS if missing or older than 7 days.
 
-**Default:** `ip-ranges.json`
+**Default:** `ip-ranges.json` (or `/tmp/ip-ranges.json` in Lambda environments)
 
-**Download:**
+**Auto-Download:** The script automatically downloads fresh IP ranges from AWS:
+- On first run if file doesn't exist
+- If file is older than 7 days (stale)
+- Falls back to stale cache if download fails
+
+**Manual Download (optional):**
 
 ```bash
 curl -o ip-ranges.json https://ip-ranges.amazonaws.com/ip-ranges.json
@@ -252,6 +257,25 @@ curl -o ip-ranges.json https://ip-ranges.amazonaws.com/ip-ranges.json
 ```bash
 --aws-ip-ranges-file /var/cache/aws-ip-ranges.json
 --aws-ip-ranges-file ""  # Disable AWS IP exclusion (not recommended)
+```
+
+---
+
+### `--no-auto-download-ip-ranges`
+
+**Description:** Disable automatic downloading of AWS IP ranges. Use this if you want to manage the ip-ranges.json file manually or in air-gapped environments.
+
+**Default:** Auto-download enabled
+
+**Examples:**
+
+```bash
+# Disable auto-download (use existing file only)
+--no-auto-download-ip-ranges
+
+# Use manual download in cron
+curl -o ip-ranges.json https://ip-ranges.amazonaws.com/ip-ranges.json
+python3 auto_block_attackers.py --no-auto-download-ip-ranges --live-run
 ```
 
 ---

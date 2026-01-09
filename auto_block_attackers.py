@@ -710,6 +710,10 @@ class NaclAutoBlocker:
         threat_signals_config: Optional[Dict] = None,
         # Enhanced Slack notifications
         enhanced_slack: bool = False,
+        # Athena integration for large-scale log analysis
+        athena_enabled: bool = False,
+        athena_database: str = "alb_logs",
+        athena_output_location: Optional[str] = None,
     ):
         setup_logging(debug, json_format=json_logging)
         logging.info("Initializing NaclAutoBlocker...")
@@ -813,6 +817,24 @@ class NaclAutoBlocker:
             self._load_processed_files_cache()
         else:
             logging.info("Force reprocess enabled - ignoring processed files cache")
+
+        # Athena integration for large-scale log analysis
+        self._athena_enabled = athena_enabled
+        self._athena_database = athena_database
+        self._athena_output_location = athena_output_location
+        self._athena = None  # Lazy initialization
+        if athena_enabled:
+            if not athena_output_location:
+                logging.warning(
+                    "Athena enabled but no output location specified. "
+                    "Use --athena-output-location to specify S3 path for query results."
+                )
+                self._athena_enabled = False
+            else:
+                logging.info(
+                    f"Athena integration enabled (database: {athena_database}, "
+                    f"output: {athena_output_location})"
+                )
 
         logging.info("Initializing AWS clients (boto3)...")
         # Enhanced boto config with adaptive retries for production stability
@@ -2430,6 +2452,354 @@ class NaclAutoBlocker:
 
         return confirmed_offenders
 
+    # -------------------------------------------------------------------------
+    # Athena Integration for Large-Scale Log Analysis
+    # -------------------------------------------------------------------------
+
+    def _init_athena(self):
+        """Initialize Athena client if not already done."""
+        if not hasattr(self, '_athena') or self._athena is None:
+            self._athena = boto3.client("athena", region_name=self.region)
+
+    def _setup_athena_table(
+        self,
+        database: str,
+        table_name: str,
+        s3_log_location: str,
+        output_location: str,
+    ) -> bool:
+        """
+        Create or verify the Athena table for ALB logs.
+
+        Uses the standard ALB log format as defined by AWS.
+
+        Args:
+            database: Athena database name
+            table_name: Table name to create
+            s3_log_location: S3 location of ALB logs (s3://bucket/prefix/)
+            output_location: S3 location for query results
+
+        Returns:
+            bool: True if table exists or was created successfully
+        """
+        self._init_athena()
+
+        # ALB log table DDL (standard AWS format)
+        create_table_query = f"""
+        CREATE EXTERNAL TABLE IF NOT EXISTS {database}.{table_name} (
+            type string,
+            time string,
+            elb string,
+            client_ip string,
+            client_port int,
+            target_ip string,
+            target_port int,
+            request_processing_time double,
+            target_processing_time double,
+            response_processing_time double,
+            elb_status_code int,
+            target_status_code string,
+            received_bytes bigint,
+            sent_bytes bigint,
+            request_verb string,
+            request_url string,
+            request_proto string,
+            user_agent string,
+            ssl_cipher string,
+            ssl_protocol string,
+            target_group_arn string,
+            trace_id string,
+            domain_name string,
+            chosen_cert_arn string,
+            matched_rule_priority string,
+            request_creation_time string,
+            actions_executed string,
+            redirect_url string,
+            lambda_error_reason string,
+            target_port_list string,
+            target_status_code_list string,
+            classification string,
+            classification_reason string
+        )
+        ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.RegexSerDe'
+        WITH SERDEPROPERTIES (
+            'serialization.format' = '1',
+            'input.regex' =
+            '([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*):([0-9]*) ([^ ]*)[:-]([0-9]*) ([-.0-9]*) ([-.0-9]*) ([-.0-9]*) (|[-0-9]*) (-|[-0-9]*) ([-0-9]*) ([-0-9]*) \"([^ ]*) (.*) (- |[^ ]*)\" \"([^\"]*)\" ([A-Z0-9-_]+) ([A-Za-z0-9.-]*) ([^ ]*) \"([^\"]*)\" \"([^\"]*)\" \"([^\"]*)\" ([-.0-9]*) ([^ ]*) \"([^\"]*)\" \"([^\"]*)\" \"([^ ]*)\" \"([^\\s]+?)\" \"([^\\s]+)\" \"([^ ]*)\" \"([^ ]*)\"'
+        )
+        LOCATION '{s3_log_location}'
+        """
+
+        try:
+            # Create database if not exists
+            self._execute_athena_query(
+                f"CREATE DATABASE IF NOT EXISTS {database}",
+                output_location,
+                wait=True,
+            )
+
+            # Create table
+            self._execute_athena_query(
+                create_table_query,
+                output_location,
+                wait=True,
+            )
+
+            logging.info(f"Athena table {database}.{table_name} ready")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to set up Athena table: {e}")
+            return False
+
+    def _execute_athena_query(
+        self,
+        query: str,
+        output_location: str,
+        database: Optional[str] = None,
+        wait: bool = True,
+        timeout_seconds: int = 300,
+    ) -> Optional[str]:
+        """
+        Execute an Athena query and optionally wait for completion.
+
+        Args:
+            query: SQL query to execute
+            output_location: S3 location for results
+            database: Optional database context
+            wait: If True, poll until query completes
+            timeout_seconds: Max time to wait for query
+
+        Returns:
+            str: Query execution ID if successful, None on failure
+        """
+        self._init_athena()
+
+        try:
+            params = {
+                "QueryString": query,
+                "ResultConfiguration": {
+                    "OutputLocation": output_location,
+                },
+            }
+            if database:
+                params["QueryExecutionContext"] = {"Database": database}
+
+            response = self._athena.start_query_execution(**params)
+            query_id = response["QueryExecutionId"]
+            logging.debug(f"Started Athena query: {query_id}")
+
+            if wait:
+                return self._wait_for_athena_query(query_id, timeout_seconds)
+            return query_id
+
+        except Exception as e:
+            logging.error(f"Failed to execute Athena query: {e}")
+            return None
+
+    def _wait_for_athena_query(
+        self,
+        query_id: str,
+        timeout_seconds: int = 300,
+    ) -> Optional[str]:
+        """
+        Wait for an Athena query to complete.
+
+        Args:
+            query_id: Query execution ID
+            timeout_seconds: Max time to wait
+
+        Returns:
+            str: Query ID if successful, None on failure
+        """
+        import time
+
+        start_time = time.time()
+        poll_interval = 1  # Start with 1 second
+
+        while time.time() - start_time < timeout_seconds:
+            try:
+                response = self._athena.get_query_execution(
+                    QueryExecutionId=query_id
+                )
+                state = response["QueryExecution"]["Status"]["State"]
+
+                if state == "SUCCEEDED":
+                    return query_id
+                elif state in ("FAILED", "CANCELLED"):
+                    reason = response["QueryExecution"]["Status"].get(
+                        "StateChangeReason", "Unknown"
+                    )
+                    logging.error(f"Athena query {state}: {reason}")
+                    return None
+
+                # Exponential backoff (max 30s)
+                time.sleep(poll_interval)
+                poll_interval = min(poll_interval * 1.5, 30)
+
+            except Exception as e:
+                logging.error(f"Error polling Athena query status: {e}")
+                return None
+
+        logging.error(f"Athena query timed out after {timeout_seconds}s")
+        return None
+
+    def _query_athena_for_attackers(
+        self,
+        database: str,
+        table_name: str,
+        output_location: str,
+        lookback_hours: float,
+        attack_patterns: List[str],
+        min_count: int,
+    ) -> Optional[Counter]:
+        """
+        Query Athena for IPs matching attack patterns with hit counts.
+
+        This is more efficient than processing individual log files for
+        large-scale analysis across many log files.
+
+        Args:
+            database: Athena database name
+            table_name: Table name
+            output_location: S3 location for query results
+            lookback_hours: How far back to look
+            attack_patterns: SQL LIKE patterns for attacks
+            min_count: Minimum hit count to include
+
+        Returns:
+            Counter: IP -> hit count mapping, or None on failure
+        """
+        self._init_athena()
+
+        # Build WHERE clause for attack patterns
+        pattern_conditions = " OR ".join([
+            f"request_url LIKE '%{pattern}%'"
+            for pattern in attack_patterns
+        ])
+
+        # Calculate time boundary
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        time_filter = cutoff_time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        query = f"""
+        SELECT
+            client_ip,
+            COUNT(*) as hit_count
+        FROM {database}.{table_name}
+        WHERE
+            time >= '{time_filter}'
+            AND ({pattern_conditions})
+        GROUP BY client_ip
+        HAVING COUNT(*) >= {min_count}
+        ORDER BY hit_count DESC
+        LIMIT 10000
+        """
+
+        query_id = self._execute_athena_query(
+            query,
+            output_location,
+            database=database,
+            wait=True,
+            timeout_seconds=600,  # 10 minutes for large queries
+        )
+
+        if not query_id:
+            return None
+
+        return self._get_athena_results_as_counter(query_id)
+
+    def _get_athena_results_as_counter(self, query_id: str) -> Optional[Counter]:
+        """
+        Get Athena query results and convert to Counter.
+
+        Args:
+            query_id: Completed query execution ID
+
+        Returns:
+            Counter: IP -> count mapping, or None on failure
+        """
+        self._init_athena()
+
+        try:
+            paginator = self._athena.get_paginator("get_query_results")
+            results = Counter()
+
+            for page in paginator.paginate(QueryExecutionId=query_id):
+                for row in page["ResultSet"]["Rows"][1:]:  # Skip header
+                    data = row["Data"]
+                    if len(data) >= 2:
+                        ip = data[0].get("VarCharValue", "")
+                        count_str = data[1].get("VarCharValue", "0")
+                        if ip and count_str.isdigit():
+                            results[ip] = int(count_str)
+
+            logging.info(f"Athena query returned {len(results)} IPs")
+            return results
+
+        except Exception as e:
+            logging.error(f"Failed to get Athena results: {e}")
+            return None
+
+    def _process_logs_via_athena(
+        self,
+        log_location: str,
+        lookback_hours: float,
+    ) -> Optional[Counter]:
+        """
+        Process ALB logs using Athena for large-scale analysis.
+
+        This method is an alternative to _process_logs_in_parallel() for
+        scenarios with many log files where S3 GetObject would be too slow.
+
+        Args:
+            log_location: S3 URI for ALB logs (s3://bucket/prefix/)
+            lookback_hours: How far back to analyze
+
+        Returns:
+            Counter: IP -> hit count mapping, or None on failure
+        """
+        if not self._athena_enabled:
+            logging.warning("Athena integration not enabled")
+            return None
+
+        # Derive table name from LB pattern
+        safe_pattern = re.sub(r'[^a-zA-Z0-9]', '_', self.lb_name_pattern)
+        table_name = f"alb_logs_{safe_pattern}_{self.region.replace('-', '_')}"
+
+        # Set up table if needed
+        if not self._setup_athena_table(
+            self._athena_database,
+            table_name,
+            log_location,
+            self._athena_output_location,
+        ):
+            return None
+
+        # Attack patterns for SQL LIKE queries
+        sql_patterns = [
+            "../",           # Path traversal
+            ".env",          # Environment file access
+            ".git",          # Git repository access
+            "wp-login",      # WordPress login
+            "wp-admin",      # WordPress admin
+            "phpmyadmin",    # phpMyAdmin
+            "<script",       # XSS
+            "UNION SELECT",  # SQL injection
+            "eval(",         # Code injection
+            "/etc/passwd",   # System file access
+            ".php?",         # PHP with params (often exploits)
+        ]
+
+        return self._query_athena_for_attackers(
+            self._athena_database,
+            table_name,
+            self._athena_output_location,
+            lookback_hours,
+            sql_patterns,
+            self.threshold,
+        )
+
     def _get_nacl_rules(self, nacl_id: str) -> Tuple[Dict[int, str], Set[int]]:
         """Gets all rules for a given NACL and separates them."""
         try:
@@ -3450,6 +3820,24 @@ Example Live Run (scans a specific pattern, provides a whitelist):
         action="store_true",
         help="Enable enhanced Slack notifications with color coding, threading, and formatted fields.",
     )
+
+    # Athena integration options
+    parser.add_argument(
+        "--athena",
+        action="store_true",
+        help="Enable Athena for large-scale log analysis. Recommended for >1000 log files.",
+    )
+    parser.add_argument(
+        "--athena-database",
+        default="alb_logs",
+        help="Athena database name for ALB log tables (default: alb_logs).",
+    )
+    parser.add_argument(
+        "--athena-output-location",
+        default=None,
+        help="S3 location for Athena query results (e.g., s3://my-bucket/athena-results/). Required if --athena is used.",
+    )
+
     parser.add_argument(
         "--ipinfo-token",
         default=None,
@@ -3682,5 +4070,9 @@ Example Live Run (scans a specific pattern, provides a whitelist):
         threat_signals_config=threat_signals_config,
         # Enhanced Slack notifications
         enhanced_slack=args.enhanced_slack,
+        # Athena integration
+        athena_enabled=args.athena,
+        athena_database=args.athena_database,
+        athena_output_location=args.athena_output_location,
     )
     blocker.run()

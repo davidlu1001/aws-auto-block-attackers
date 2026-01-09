@@ -1120,6 +1120,143 @@ class TestEnhancedSlackNotifications(unittest.TestCase):
         blocker.slack_client.post_incident_notification.assert_not_called()
 
 
+class TestAthenaIntegration(unittest.TestCase):
+    """Test Athena integration for large-scale log analysis"""
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_athena_disabled_by_default(self, mock_boto_client):
+        """Test that Athena is disabled by default"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+        )
+
+        self.assertFalse(blocker._athena_enabled)
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_athena_enabled_without_output_location(self, mock_boto_client):
+        """Test that Athena is disabled if no output location provided"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            athena_enabled=True,
+            athena_output_location=None,  # Missing!
+        )
+
+        # Should be disabled due to missing output location
+        self.assertFalse(blocker._athena_enabled)
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_athena_enabled_with_output_location(self, mock_boto_client):
+        """Test that Athena is enabled when output location provided"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            athena_enabled=True,
+            athena_output_location="s3://my-bucket/athena-results/",
+        )
+
+        self.assertTrue(blocker._athena_enabled)
+        self.assertEqual(blocker._athena_database, "alb_logs")
+        self.assertEqual(blocker._athena_output_location, "s3://my-bucket/athena-results/")
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_athena_custom_database(self, mock_boto_client):
+        """Test custom Athena database name"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            athena_enabled=True,
+            athena_database="custom_logs_db",
+            athena_output_location="s3://my-bucket/athena-results/",
+        )
+
+        self.assertEqual(blocker._athena_database, "custom_logs_db")
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_athena_init_lazy(self, mock_boto_client):
+        """Test that Athena client is lazily initialized"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            athena_enabled=True,
+            athena_output_location="s3://my-bucket/athena-results/",
+        )
+
+        # Athena client should not be initialized yet
+        self.assertIsNone(blocker._athena)
+
+        # Initialize it
+        blocker._init_athena()
+
+        # Should now be initialized (the mock)
+        mock_boto_client.assert_any_call("athena", region_name="us-east-1")
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_process_logs_via_athena_disabled(self, mock_boto_client):
+        """Test that _process_logs_via_athena returns None when disabled"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            athena_enabled=False,
+        )
+
+        result = blocker._process_logs_via_athena(
+            "s3://bucket/logs/",
+            lookback_hours=1.0,
+        )
+
+        self.assertIsNone(result)
+
+
 class TestSlackClientEnhanced(unittest.TestCase):
     """Test enhanced SlackClient functionality"""
 
@@ -1216,6 +1353,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestLoggingAndMetrics))
     suite.addTests(loader.loadTestsFromTestCase(TestMultiSignalDetection))
     suite.addTests(loader.loadTestsFromTestCase(TestEnhancedSlackNotifications))
+    suite.addTests(loader.loadTestsFromTestCase(TestAthenaIntegration))
     suite.addTests(loader.loadTestsFromTestCase(TestSlackClientEnhanced))
 
     # Run tests

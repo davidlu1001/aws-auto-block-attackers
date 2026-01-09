@@ -157,6 +157,64 @@ class TestAWSIPRangeIndex:
         assert index.total_ipv6 == 0
         assert index.is_aws_ip("1.2.3.4") is False
 
+    def test_overlapping_ranges(self):
+        """Test handling of overlapping IP ranges (e.g., /16 with /26 subnets).
+
+        AWS IP ranges contain overlapping CIDRs where a /16 may be followed
+        by smaller /26 subnets. The bisect lookup must check backwards to find
+        the containing /16 when a /26 doesn't contain the target IP.
+        """
+        # Simulate AWS ranges with overlapping /16 and /26
+        overlapping_data = {
+            "syncToken": "test",
+            "createDate": "2026-01-09",
+            "prefixes": [
+                # A /16 that should contain 54.252.193.112
+                {"ip_prefix": "54.252.0.0/16", "region": "ap-southeast-2", "service": "AMAZON"},
+                # A /26 subnet within the /16 (doesn't contain 54.252.193.112)
+                {"ip_prefix": "54.252.79.128/26", "region": "ap-southeast-2", "service": "EC2"},
+                # Another /26 subnet
+                {"ip_prefix": "54.252.254.192/26", "region": "ap-southeast-2", "service": "EC2"},
+            ],
+            "ipv6_prefixes": []
+        }
+
+        index = AWSIPRangeIndex.from_json_data(overlapping_data)
+
+        # IP in the /16 but NOT in any /26 - should still be found
+        assert index.is_aws_ip("54.252.193.112") is True, \
+            "IP in /16 but not in /26 should be found via backward search"
+
+        # IP directly in the /26 should be found
+        assert index.is_aws_ip("54.252.79.140") is True, \
+            "IP in /26 should be found directly"
+
+        # IP outside all ranges
+        assert index.is_aws_ip("1.2.3.4") is False
+
+    def test_overlapping_ranges_service_lookup(self):
+        """Test service lookup with overlapping ranges."""
+        overlapping_data = {
+            "syncToken": "test",
+            "createDate": "2026-01-09",
+            "prefixes": [
+                {"ip_prefix": "54.252.0.0/16", "region": "ap-southeast-2", "service": "AMAZON"},
+                {"ip_prefix": "54.252.79.128/26", "region": "ap-southeast-2", "service": "EC2"},
+            ],
+            "ipv6_prefixes": []
+        }
+
+        index = AWSIPRangeIndex.from_json_data(overlapping_data)
+
+        # IP in /16 but not /26 should return AMAZON service
+        service = index.get_service_for_ip("54.252.193.112")
+        assert service == "AMAZON", f"Expected AMAZON, got {service}"
+
+        # IP in both /16 and /26 - returns first matching service found
+        # (AMAZON comes before EC2 in dict iteration order)
+        service = index.get_service_for_ip("54.252.79.140")
+        assert service in ("AMAZON", "EC2"), f"Expected AMAZON or EC2, got {service}"
+
 
 class TestAutoDownload:
     """Tests for auto-download functionality."""

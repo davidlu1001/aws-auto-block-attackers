@@ -483,6 +483,8 @@ class AWSIPRangeIndex:
         This enables dynamic verification without hardcoded IPs.
         Service names come from ip-ranges.json (e.g., 'ROUTE53_HEALTHCHECKS', 'CLOUDFRONT').
 
+        Handles overlapping ranges by searching backwards from bisect position.
+
         Args:
             ip_str: IP address to check
             service_name: AWS service name from ip-ranges.json
@@ -504,13 +506,23 @@ class AWSIPRangeIndex:
 
             # Binary search in service-specific ranges
             starts = [r[0] for r in ranges]
-            idx = bisect.bisect_right(starts, ip_int) - 1
+            initial_idx = bisect.bisect_right(starts, ip_int) - 1
 
-            if idx < 0:
+            if initial_idx < 0:
                 return False
 
-            start_int, end_int = ranges[idx]
-            return start_int <= ip_int <= end_int
+            # Check current and previous ranges for overlapping ranges
+            # Limit search to 100 ranges back to avoid O(n) worst case
+            idx = initial_idx
+            while idx >= 0 and idx > initial_idx - 100:
+                start_int, end_int = ranges[idx]
+
+                if start_int <= ip_int <= end_int:
+                    return True
+
+                idx -= 1
+
+            return False
 
         except ValueError:
             return False
@@ -518,6 +530,8 @@ class AWSIPRangeIndex:
     def get_service_for_ip(self, ip_str: str) -> Optional[str]:
         """
         Get the AWS service name for an IP address.
+
+        Handles overlapping ranges by searching backwards from bisect position.
 
         Args:
             ip_str: IP address to check
@@ -536,14 +550,21 @@ class AWSIPRangeIndex:
                     continue
 
                 starts = [r[0] for r in ranges]
-                idx = bisect.bisect_right(starts, ip_int) - 1
+                initial_idx = bisect.bisect_right(starts, ip_int) - 1
 
-                if idx < 0:
+                if initial_idx < 0:
                     continue
 
-                start_int, end_int = ranges[idx]
-                if start_int <= ip_int <= end_int:
-                    return service_name
+                # Check current and previous ranges for overlapping ranges
+                # Limit search to 100 ranges back to avoid O(n) worst case
+                idx = initial_idx
+                while idx >= 0 and idx > initial_idx - 100:
+                    start_int, end_int = ranges[idx]
+
+                    if start_int <= ip_int <= end_int:
+                        return service_name
+
+                    idx -= 1
 
             return None
 
@@ -553,6 +574,11 @@ class AWSIPRangeIndex:
     def _bisect_lookup(self, ip_str: str) -> Optional[str]:
         """
         Binary search for IP in all ranges.
+
+        Handles overlapping ranges (e.g., /16 and /26 subnets) by searching
+        backwards from the bisect position. AWS IP ranges contain overlapping
+        CIDRs where a /16 may be followed by smaller /26 subnets with higher
+        start addresses but lower end addresses.
 
         Returns matching CIDR or None.
         """
@@ -572,10 +598,31 @@ class AWSIPRangeIndex:
             if idx < 0:
                 return None
 
-            start_int, end_int, cidr = ranges[idx]
+            # Check current and previous ranges for overlapping ranges
+            # We must check backwards because a /16 (with lower start but higher end)
+            # may be before a /26 (with higher start but lower end)
+            # Track the maximum end seen - if we see a range where end >= ip_int,
+            # there's potential for earlier ranges to contain the IP
+            max_end_seen = 0
+            while idx >= 0:
+                start_int, end_int, cidr = ranges[idx]
 
-            if start_int <= ip_int <= end_int:
-                return cidr
+                if start_int <= ip_int <= end_int:
+                    return cidr
+
+                max_end_seen = max(max_end_seen, end_int)
+
+                # We can stop if ALL ranges from here backwards have start > ip_int
+                # But since ranges are sorted by start and we started at rightmost start <= ip_int,
+                # earlier ranges also have start <= ip_int. So we need a different exit condition:
+                # If max_end_seen < ip_int and current start is far enough from ip_int that
+                # no /8 or larger could contain it, we can stop.
+                # For simplicity, limit the backwards search to avoid O(n) worst case.
+                # AWS ranges are dense, so checking ~100 ranges back should cover most overlaps.
+                if idx < (bisect.bisect_right(starts, ip_int) - 1) - 100:
+                    break
+
+                idx -= 1
 
             return None
 

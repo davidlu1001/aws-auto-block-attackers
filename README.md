@@ -3,118 +3,111 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Tests](https://img.shields.io/badge/tests-159%20passing-brightgreen.svg)]()
 
-Automated AWS Network ACL (NACL) management tool that analyzes Application Load Balancer (ALB) access logs, detects malicious traffic patterns, and implements tiered time-based IP blocking with persistent storage.
+Automated AWS security tool that analyzes Application Load Balancer (ALB) access logs, detects malicious traffic patterns using multi-signal analysis, and implements tiered time-based IP blocking via Network ACLs (NACLs) and AWS WAF IP Sets.
 
-## 🚀 Features
+## What's New in v2.0
 
-- **Tiered Blocking System**: Automatically categorizes attackers into 5 tiers (Critical, High, Medium, Low, Minimal) based on attack volume
-- **Time-Based Persistence**: Blocks persist for hours to days depending on severity, with expiration tracking via JSON registry
-- **Priority-Based Slot Management**: Critical attackers won't be displaced by lower-priority threats when NACL slots are full
-- **Attack Pattern Detection**: Comprehensive regex patterns detect LFI, XSS, SQL injection, command injection, and more
-- **Smart API Caching**: Built-in IPInfo API caching reduces rate limit concerns
-- **Slack Integration**: Real-time notifications with detailed attack context and tier information
-- **AWS IP Exclusion**: Automatically excludes AWS service IPs from blocking
-- **Dry-Run Mode**: Test blocking logic without making actual changes
-- **Self-Healing**: Handles corrupted registry files, missing configurations, and API failures gracefully
+- **Cloud-Native Storage**: DynamoDB and S3 backends for distributed deployments
+- **IPv6 Support**: Full dual-stack blocking with separate rule ranges
+- **AWS WAF Integration**: Parallel blocking via WAF IP Sets for edge protection
+- **Multi-Signal Detection**: Reduces false positives by correlating multiple threat indicators
+- **Athena Integration**: SQL-based analysis for large-scale log processing
+- **Enhanced Slack Notifications**: Color-coded severity, threading, Block Kit formatting
+- **CloudWatch Metrics**: Built-in observability with custom namespace support
+- **Structured JSON Logging**: CloudWatch Logs compatible output
 
-## 📋 Table of Contents
+## Features
 
-- [Features](#-features)
-- [Prerequisites](#-prerequisites)
-- [Installation](#-installation)
-- [Quick Start](#-quick-start)
-- [Configuration](#-configuration)
-- [Usage](#-usage)
-- [Tier System](#-tier-system)
-- [Architecture](#-architecture)
-- [Monitoring](#-monitoring)
-- [Troubleshooting](#-troubleshooting)
-- [Contributing](#-contributing)
-- [License](#-license)
-- [Security](#-security)
+### Core Capabilities
 
-## 📦 Prerequisites
+- **Tiered Blocking System**: 5-tier classification (Critical→Minimal) with proportional block durations
+- **Multi-Signal Threat Detection**: Correlates attack patterns, scanner signatures, error rates, and path diversity
+- **IPv4 + IPv6 Support**: Dual-stack blocking with independent rule management
+- **Priority-Based Slot Management**: Critical attackers won't be displaced by lower-priority threats
+
+### Attack Detection
+
+- **30+ Attack Patterns**: LFI, XSS, SQL injection, command injection, path traversal, etc.
+- **Scanner Detection**: Known scanner user-agent identification (Nikto, sqlmap, etc.)
+- **Behavioral Analysis**: Error rate and path diversity scoring
+
+### Integration Options
+
+- **AWS WAF IP Sets**: Parallel blocking at edge (CloudFront, ALB, API Gateway)
+- **Slack Notifications**: Real-time alerts with severity-based color coding
+- **CloudWatch Metrics**: Operational metrics for dashboards and alarms
+- **Athena Queries**: SQL-based analysis for historical data
+
+### Operational Features
+
+- **Cloud-Native Storage**: DynamoDB, S3, or local file persistence
+- **Incremental Processing**: Skip already-analyzed log files
+- **Circuit Breakers**: Graceful degradation on external service failures
+- **Dry-Run Mode**: Test blocking logic without making changes
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Tier System](#tier-system)
+- [Storage Backends](#storage-backends)
+- [AWS WAF Integration](#aws-waf-integration)
+- [Multi-Signal Detection](#multi-signal-detection)
+- [Athena Integration](#athena-integration)
+- [Observability](#observability)
+- [Architecture](#architecture)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Prerequisites
 
 ### Required
 
 - **Python**: 3.8 or higher
-- **AWS Account**: With ALB access logs enabled
-- **IAM Permissions**: See [IAM Policy](#iam-permissions) below
-- **ALB Logging**: Must be enabled and configured to S3
+- **AWS Account**: With ALB access logs enabled to S3
+- **IAM Permissions**: See [IAM Policy](#iam-permissions)
 
 ### Optional
 
-- **Slack Bot Token**: For notifications (recommended)
-- **IPInfo API Token**: For IP geolocation (optional)
+- **Slack Bot Token**: For notifications
+- **IPInfo API Token**: For IP geolocation
+- **DynamoDB/S3**: For cloud-native state storage
+- **Athena**: For large-scale log analysis
 
-## 🔧 Installation
+## Installation
 
-### Option 1: Using uv (Recommended)
-
-[uv](https://github.com/astral-sh/uv) is a fast Python package installer and resolver.
+### Using uv (Recommended)
 
 ```bash
-# Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Clone the repository
 git clone https://github.com/davidlu1001/aws-auto-block-attackers.git
 cd aws-auto-block-attackers
-
-# Install dependencies with uv
 uv sync
-
-# Copy example configuration files
-cp examples/whitelist.example.txt whitelist.txt
-cp examples/.env.example .env
-
-# Edit configuration files with your settings
-vim .env
-vim whitelist.txt
 ```
 
-### Option 2: Using pip
+### Using pip
 
 ```bash
-# Clone the repository
 git clone https://github.com/davidlu1001/aws-auto-block-attackers.git
 cd aws-auto-block-attackers
-
-# Create virtual environment
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+source venv/bin/activate
 pip install -e .
-
-# Copy example configuration
-cp examples/whitelist.example.txt whitelist.txt
-cp examples/.env.example .env
 ```
 
-### Option 3: Using Docker
+### Using Docker
 
 ```bash
 docker pull davidlu1001/aws-auto-block-attackers:latest
-docker run -v $(pwd)/config.yaml:/app/config.yaml aws-auto-block-attackers
+docker run -v $(pwd)/config:/app/config aws-auto-block-attackers --live-run
 ```
 
-### Option 4: Manual Installation
-
-```bash
-# Install dependencies
-pip install boto3 ipinfo slack-sdk requests
-
-# Download the scripts
-wget https://raw.githubusercontent.com/davidlu1001/aws-auto-block-attackers/main/auto_block_attackers.py
-wget https://raw.githubusercontent.com/davidlu1001/aws-auto-block-attackers/main/slack_client.py
-
-# Make them executable
-chmod +x auto_block_attackers.py
-```
-
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Configure AWS Credentials
 
@@ -123,374 +116,347 @@ chmod +x auto_block_attackers.py
 aws configure
 
 # Option B: Environment variables
-export AWS_ACCESS_KEY_ID="your-access-key"
-export AWS_SECRET_ACCESS_KEY="your-secret-key"
-export AWS_DEFAULT_REGION="ap-southeast-2"
+export AWS_ACCESS_KEY_ID="your-key"
+export AWS_SECRET_ACCESS_KEY="your-secret"
+export AWS_DEFAULT_REGION="us-east-1"
 
-# Option C: IAM Role (recommended for EC2)
-# Attach IAM role to EC2 instance
+# Option C: IAM Role (recommended for EC2/ECS)
 ```
 
-### 2. Enable ALB Access Logs
+### 2. Run Dry-Run Scan
 
 ```bash
-# Via AWS CLI
-aws elbv2 modify-load-balancer-attributes \
-  --load-balancer-arn arn:aws:elasticloadbalancing:region:account-id:loadbalancer/app/my-alb/... \
-  --attributes Key=access_logs.s3.enabled,Value=true Key=access_logs.s3.bucket,Value=my-bucket
-```
-
-### 3. Run Your First Scan (Dry-Run)
-
-```bash
-# Using uv (recommended)
-uv run python3 auto_block_attackers.py \
-  --lb-name-pattern "alb-*" \
-  --region ap-southeast-2 \
-  --lookback 1h \
-  --threshold 50 \
-  --debug
-
-# Or directly with python (if using pip install)
 python3 auto_block_attackers.py \
   --lb-name-pattern "alb-*" \
-  --region ap-southeast-2 \
   --lookback 1h \
   --threshold 50 \
   --debug
 ```
 
-### 4. Deploy to Production
+### 3. Run Live Blocking
 
 ```bash
-# Add to crontab for automated execution every 15 minutes
-crontab -e
-
-# Using uv (recommended):
-*/15 * * * * cd /opt/aws-auto-block-attackers && /usr/local/bin/uv run python3 auto_block_attackers.py \
-  --lb-name-pattern "alb-prod-*" \
-  --threshold 75 \
-  --lookback 90m \
-  --live-run \
-  >> /var/log/auto-block-attackers.log 2>&1
-
-# Or using systemd timer (see examples/systemd-timer-example.timer)
+python3 auto_block_attackers.py \
+  --lb-name-pattern "prod-*" \
+  --lookback 1h \
+  --threshold 50 \
+  --live-run
 ```
 
-## ⚙️ Configuration
+### 4. Production Deployment (Cron)
+
+```bash
+# Run every 15 minutes
+*/15 * * * * cd /opt/auto-block && python3 auto_block_attackers.py \
+  --lb-name-pattern "prod-*" \
+  --threshold 75 \
+  --lookback 90m \
+  --storage-backend dynamodb \
+  --dynamodb-table block-registry \
+  --enable-cloudwatch-metrics \
+  --enhanced-slack \
+  --live-run >> /var/log/auto-block.log 2>&1
+```
+
+## Configuration
+
+### Command-Line Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--lb-name-pattern` | `alb-*` | Pattern to match load balancer names |
+| `--region` | `ap-southeast-2` | AWS region |
+| `--lookback` | `60m` | Lookback period (30m, 2h, 1d) |
+| `--threshold` | `50` | Minimum hits to trigger block |
+| `--start-rule` | `80` | Starting NACL rule number (IPv4) |
+| `--limit` | `20` | Maximum DENY rules (IPv4) |
+| `--start-rule-ipv6` | `180` | Starting NACL rule number (IPv6) |
+| `--limit-ipv6` | `20` | Maximum DENY rules (IPv6) |
+| `--live-run` | `False` | Actually make changes |
+| `--debug` | `False` | Verbose logging |
+
+### Storage Options
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--storage-backend` | `local` | Storage type: local, dynamodb, s3 |
+| `--dynamodb-table` | - | DynamoDB table name |
+| `--create-dynamodb-table` | `False` | Auto-create DynamoDB table |
+| `--s3-state-bucket` | - | S3 bucket for state |
+| `--s3-state-key` | - | S3 key for state |
+
+### WAF Options
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--waf-ip-set-name` | - | WAF IP Set name |
+| `--waf-ip-set-scope` | `REGIONAL` | REGIONAL or CLOUDFRONT |
+| `--create-waf-ip-set` | `False` | Auto-create IP Set |
+
+### Observability Options
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--json-logging` | `False` | JSON log format |
+| `--enable-cloudwatch-metrics` | `False` | Publish metrics |
+| `--cloudwatch-namespace` | `AutoBlockAttackers` | Metrics namespace |
+| `--enhanced-slack` | `False` | Rich Slack notifications |
+
+### Multi-Signal Options
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--disable-multi-signal` | `False` | Disable multi-signal detection |
+| `--min-threat-score` | `40` | Minimum score (0-100) |
+
+### Athena Options
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--athena` | `False` | Enable Athena queries |
+| `--athena-database` | `alb_logs` | Athena database name |
+| `--athena-output-location` | - | S3 path for results |
 
 ### Environment Variables
 
 ```bash
-# Slack (optional but recommended)
-export SLACK_BOT_TOKEN="xoxb-your-token"
-export SLACK_CHANNEL="C04ABCDEFG"
-
-# IPInfo (optional)
-export IPINFO_TOKEN="your-ipinfo-token"
-
-# AWS (if not using IAM role)
-export AWS_ACCESS_KEY_ID="your-key"
-export AWS_SECRET_ACCESS_KEY="your-secret"
-export AWS_DEFAULT_REGION="ap-southeast-2"
+SLACK_BOT_TOKEN="xoxb-your-token"
+SLACK_CHANNEL="C04ABCDEFG"
+IPINFO_TOKEN="your-ipinfo-token"
+STORAGE_BACKEND="dynamodb"
+DYNAMODB_TABLE="block-registry"
 ```
 
-### Command-Line Arguments
+See [docs/CLI_GUIDE.md](docs/CLI_GUIDE.md) for complete reference.
 
-| Argument               | Default               | Description                                     |
-| ---------------------- | --------------------- | ----------------------------------------------- |
-| `--lb-name-pattern`    | `alb-*`               | Pattern to match load balancer names            |
-| `--region`             | `ap-southeast-2`      | AWS region                                      |
-| `--lookback`           | `60m`                 | Lookback period (format: 30m, 2h, 1d)           |
-| `--threshold`          | `50`                  | Minimum malicious requests to trigger block     |
-| `--start-rule`         | `80`                  | Starting NACL rule number                       |
-| `--limit`              | `20`                  | Maximum number of DENY rules to manage          |
-| `--whitelist-file`     | `whitelist.txt`       | Path to whitelist file                          |
-| `--aws-ip-ranges-file` | `ip-ranges.json`      | Path to AWS IP ranges JSON                      |
-| `--registry-file`      | `block_registry.json` | Path to block registry                          |
-| `--live-run`           | `False`               | Actually create NACL rules (default is dry-run) |
-| `--debug`              | `False`               | Enable verbose debug logging                    |
+## Tier System
 
-### Whitelist File Format
+Attackers are classified into tiers based on malicious request volume:
 
-```text
-# Comments start with #
-203.0.113.1
-203.0.113.2
-# Corporate office
-198.51.100.0/24
-```
+| Tier | Hit Count | Block Duration | Priority |
+|------|-----------|----------------|----------|
+| **Critical** | 2000+ | 7 days | 4 |
+| **High** | 1000-1999 | 3 days | 3 |
+| **Medium** | 500-999 | 48 hours | 2 |
+| **Low** | 100-499 | 24 hours | 1 |
+| **Minimal** | <100 | 1 hour | 0 |
 
-## 🎯 Tier System
+### Tier Upgrade
 
-The script automatically categorizes attackers into tiers based on request volume:
+When an IP reoffends, its tier is upgraded and block duration extended:
 
-| Tier         | Hit Count | Block Duration | Priority | Description               |
-| ------------ | --------- | -------------- | -------- | ------------------------- |
-| **Critical** | 2000+     | 7 days         | 4        | Major coordinated attacks |
-| **High**     | 1000-1999 | 3 days         | 3        | Severe automated scanning |
-| **Medium**   | 500-999   | 48 hours       | 2        | Moderate attack attempts  |
-| **Low**      | 100-499   | 24 hours       | 1        | Light scanning activity   |
-| **Minimal**  | <100      | 1 hour         | 0        | Minor probes              |
-
-### Example Scenarios
-
-#### Scenario 1: High-Volume Attacker
-```
-IP: 1.2.3.4 sends 1,568 malicious requests
-→ Classified as "High" tier
-→ Blocked for 3 days
-→ Entry saved to registry with expiration
-→ Slack notification: "Blocked 1.2.3.4 (1568 hits, tier: HIGH, blocked for 3d)"
-```
-
-#### Scenario 2: Tier Upgrade
 ```
 T+0:  IP sends 150 requests → Blocked as "Low" (24 hours)
-T+2h: Same IP returns with 600 more → Upgraded to "Medium" (48 hours)
-      → Block duration extended from T+2h
+T+2h: Same IP returns with 600 more → Upgraded to "Medium" (48 hours from T+2h)
 ```
 
-#### Scenario 3: Priority Protection
-```
-NACL Full: 20 IPs blocked (5 High, 10 Medium, 5 Low)
-New Critical attacker (2500 hits) arrives
-→ Replaces lowest priority IP (one of the "Low" tier)
-→ High/Medium tier IPs remain protected
-```
+## Storage Backends
 
-## 🏗️ Architecture
-
-### System Flow
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ 1. Scan ALB Logs (S3)                                        │
-│    └─> Date-based filtering (fast!)                          │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 2. Detect Malicious Patterns                                 │
-│    └─> Regex: LFI, XSS, SQLi, Command Injection, etc.       │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 3. Apply Filters                                             │
-│    ├─> Whitelist check                                       │
-│    ├─> AWS IP exclusion                                      │
-│    └─> Threshold validation                                  │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 4. Tier Classification                                       │
-│    └─> Determine block duration based on hit count          │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 5. Registry Management                                       │
-│    ├─> Load existing blocks                                  │
-│    ├─> Check expirations                                     │
-│    ├─> Update/merge new blocks                               │
-│    └─> Save to JSON                                          │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 6. NACL Updates                                              │
-│    ├─> Remove expired blocks                                 │
-│    ├─> Add new blocks (priority-based)                       │
-│    └─> Handle slot exhaustion                                │
-└─────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────┐
-│ 7. Notifications                                             │
-│    └─> Slack summary with tier breakdown                    │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### File Structure
-
-```
-aws-auto-block-attackers/
-├── .github/
-│   └── workflows/
-│       └── ci.yml                      # CI/CD pipeline with uv
-├── examples/
-│   ├── .env.example                    # Environment variables template
-│   ├── config.example.yaml             # Full configuration reference
-│   ├── cron-example.txt                # Cron job examples
-│   ├── systemd-example.service         # Systemd service file
-│   ├── systemd-timer-example.timer     # Systemd timer
-│   └── whitelist.example.txt           # IP whitelist template
-├── scripts/
-│   ├── README.md                       # Scripts documentation
-│   └── update_aws_ip_ranges.sh         # AWS IP ranges updater
-├── tests/
-│   ├── test_auto_block_attackers.py    # Main script tests
-│   ├── test_integration.py             # Integration tests
-│   ├── test_ipinfo_integration.py      # IPInfo tests
-│   ├── test_notification_logic.py      # Notification tests
-│   ├── test_slack_client.py            # Slack client tests
-│   ├── test_tiered_blocking.py         # Tiered blocking tests
-│   └── test_timestamp_fix.py           # Timestamp tests
-├── .gitignore                          # Git ignore patterns
-├── auto_block_attackers.py             # Main script
-├── CONTRIBUTING.md                     # Contribution guidelines
-├── LICENSE                             # MIT License
-├── pyproject.toml                      # Project configuration (uv)
-├── README.md                           # This file
-├── SECURITY.md                         # Security policy
-├── slack_client.py                     # Slack integration module
-└── uv.lock                             # Dependency lock file
-```
-
-## 📊 Monitoring
-
-### Log Files
+### Local File (Default)
 
 ```bash
-# View real-time logs
-tail -f /var/log/auto-block-attackers.log
-
-# Check for errors
-grep -i error /var/log/auto-block-attackers.log
-
-# View blocked IPs
-grep "ACTIVE BLOCK" /var/log/auto-block-attackers.log
+--storage-backend local
+--registry-file ./block_registry.json
 ```
 
-### Registry File
+### DynamoDB
 
 ```bash
-# View current blocks
-cat ./block_registry.json | jq '.'
-
-# Check when an IP will be unblocked
-cat block_registry.json | jq '.["1.2.3.4"]'
-
-# Count active blocks by tier
-cat block_registry.json | jq '[.[] | .tier] | group_by(.) | map({tier: .[0], count: length})'
+--storage-backend dynamodb
+--dynamodb-table my-block-registry
+--create-dynamodb-table
 ```
 
-### CloudWatch Metrics (Optional)
+**Benefits**: Multi-AZ, concurrent access, automatic scaling
+
+### S3
 
 ```bash
-# Send custom metrics
-aws cloudwatch put-metric-data \
-  --namespace "Security/AutoBlock" \
-  --metric-name "IPsBlocked" \
-  --value 5 \
-  --dimensions Tier=High
+--storage-backend s3
+--s3-state-bucket my-bucket
+--s3-state-key security/registry.json
 ```
 
-## 🔍 Troubleshooting
+**Benefits**: 11 9's durability, versioning, cross-region replication
 
-### Common Issues
+## AWS WAF Integration
 
-#### 1. No IPs Being Blocked
+Block attackers at the edge in addition to VPC-level NACL blocking:
 
-**Symptoms**: Script runs but no blocks created
-
-**Possible Causes**:
-- Threshold too high
-- All IPs whitelisted
-- ALB logs not recent
-- Attack patterns not matched
-
-**Solutions**:
 ```bash
-# Lower threshold temporarily
---threshold 10
+python3 auto_block_attackers.py \
+  --lb-name-pattern "prod-*" \
+  --waf-ip-set-name "blocked-attackers" \
+  --waf-ip-set-scope REGIONAL \
+  --create-waf-ip-set \
+  --live-run
+```
 
-# Check what's being detected
---debug
+**Use Cases**:
+- Block at CloudFront edge before requests reach origin
+- Consistent blocking across multiple ALBs
+- Complement NACL blocking for defense in depth
 
-# Verify ALB logs exist
+## Multi-Signal Detection
+
+Reduces false positives by correlating multiple threat indicators:
+
+| Signal | Weight | Description |
+|--------|--------|-------------|
+| Attack Patterns | 50% | ATTACK_PATTERNS regex matches |
+| Scanner UA | 20% | Known scanner user-agents |
+| Error Rate | 15% | 4xx/5xx response percentage |
+| Path Diversity | 15% | Unique paths (scanner behavior) |
+
+**Threat Score Calculation**:
+
+```
+Score = (0.5 × attack_rate) + (0.2 × scanner_rate) +
+        (0.15 × error_rate) + (0.15 × diversity_score)
+```
+
+IPs with score < `--min-threat-score` are considered false positives.
+
+## Athena Integration
+
+For large-scale log analysis (>1000 files), use Athena:
+
+```bash
+python3 auto_block_attackers.py \
+  --lb-name-pattern "prod-*" \
+  --athena \
+  --athena-database "security_logs" \
+  --athena-output-location "s3://my-bucket/athena-results/" \
+  --lookback 24h \
+  --live-run
+```
+
+**Benefits**:
+- SQL-based filtering at scale
+- Historical analysis across days/weeks
+- Cost-effective for large datasets
+
+## Observability
+
+### Structured Logging
+
+```bash
+python3 auto_block_attackers.py --json-logging 2>&1 | tee logs.json
+```
+
+Output:
+```json
+{"timestamp": "2026-01-09T10:30:00Z", "level": "INFO", "message": "Blocked 5 IPs"}
+```
+
+### CloudWatch Metrics
+
+```bash
+--enable-cloudwatch-metrics
+--cloudwatch-namespace "Security/AutoBlock"
+```
+
+**Metrics Published**:
+- `LogFilesProcessed`
+- `MaliciousIPsDetected`
+- `IPsBlocked`
+- `IPsUnblocked`
+- `ProcessingTimeMs`
+- `AverageThreatScore`
+
+### Enhanced Slack Notifications
+
+```bash
+--enhanced-slack
+```
+
+Features:
+- Severity-based color coding (green→red)
+- Incident threading
+- Tier breakdown fields
+- Top offenders by tier
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    AWS Auto Block Attackers                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐                        ┌──────────────┐       │
+│  │   S3 Logs    │───────┬───────────────▶│  CloudWatch  │       │
+│  └──────────────┘       │                │   Metrics    │       │
+│                         ▼                └──────────────┘       │
+│  ┌──────────────┐  ┌──────────────┐                             │
+│  │    Athena    │──│    Threat    │                             │
+│  │   (Optional) │  │   Detection  │                             │
+│  └──────────────┘  └──────┬───────┘                             │
+│                          │                                       │
+│                          ▼                                       │
+│                   ┌──────────────┐                               │
+│                   │    Tier      │                               │
+│                   │Classification│                               │
+│                   └──────┬───────┘                               │
+│                          │                                       │
+│          ┌───────────────┼───────────────┐                      │
+│          ▼               ▼               ▼                      │
+│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐              │
+│   │    NACL     │ │   WAF IP    │ │   Storage   │              │
+│   │   Manager   │ │    Sets     │ │   Backend   │              │
+│   └──────┬──────┘ └──────┬──────┘ └──────┬──────┘              │
+│          │               │               │                      │
+└──────────┼───────────────┼───────────────┼──────────────────────┘
+           │               │               │
+           ▼               ▼               ▼
+    ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+    │  EC2 NACLs  │ │  AWS WAF    │ │ DynamoDB/S3 │
+    │  (IPv4/v6)  │ │  IP Sets    │ │   /Local    │
+    └─────────────┘ └─────────────┘ └─────────────┘
+```
+
+See [docs/TECHNICAL_DESIGN.md](docs/TECHNICAL_DESIGN.md) for detailed architecture.
+
+## Troubleshooting
+
+### No IPs Being Blocked
+
+```bash
+# Lower threshold and enable debug
+python3 auto_block_attackers.py --threshold 10 --debug
+
+# Verify logs exist
 aws s3 ls s3://your-bucket/your-prefix/ --recursive | tail -20
 ```
 
-#### 2. Registry File Growing Large
-
-**Symptoms**: block_registry.json is several MB
-
-**Solution**: Script auto-cleans entries >30 days old. If still large:
-```bash
-# Backup and reset
-cp block_registry.json block_registry.json.bak
-echo "{}" > block_registry.json
-```
-
-#### 3. IPInfo Rate Limit
-
-**Symptoms**: Warnings about IPInfo API failures
-
-**Solution**: Script has built-in caching. For high volume:
-- Upgrade IPInfo plan
-- Disable IPInfo: Don't set `IPINFO_TOKEN`
-
-#### 4. NACL Slots Full
-
-**Symptoms**: "Cannot add IP: all existing rules have higher priority"
-
-**Solutions**:
-- Increase `--limit` (max 20 with default start-rule 80)
-- Manually remove low-priority blocks
-- Adjust tier thresholds
-
-### Debug Mode
+### Multi-Signal Filtering Too Aggressive
 
 ```bash
-# Enable detailed logging
-uv run python3 auto_block_attackers.py --debug
+# Lower the minimum threat score
+--min-threat-score 30
 
-# Check what patterns are matching
-uv run python3 auto_block_attackers.py --debug 2>&1 | grep "malicious"
+# Or disable multi-signal entirely
+--disable-multi-signal
 ```
 
-## 🤝 Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
-### Quick Contribution Guide
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-### Development Setup
+### NACL Slots Full
 
 ```bash
-# Clone your fork
-git clone https://github.com/your-username/aws-auto-block-attackers.git
-cd aws-auto-block-attackers
-
-# Install uv if not already installed
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Install all dependencies including dev extras
-uv sync --all-extras
-
-# Run tests
-uv run pytest tests/ -v
-
-# Run linting
-uv run black auto_block_attackers.py slack_client.py
-uv run pylint auto_block_attackers.py slack_client.py
-
-# Run type checking
-uv run mypy auto_block_attackers.py slack_client.py
+# Increase limit (ensure rule range is available)
+--start-rule 70 --limit 30
 ```
 
-## 📄 License
+### DynamoDB Throttling
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+```bash
+# Use on-demand capacity mode
+aws dynamodb update-table \
+  --table-name my-block-registry \
+  --billing-mode PAY_PER_REQUEST
+```
 
-## 🔒 Security
+## IAM Permissions
 
-### IAM Permissions
-
-Minimum required IAM policy:
+Minimum required policy:
 
 ```json
 {
@@ -514,38 +480,41 @@ Minimum required IAM policy:
 }
 ```
 
-### Security Best Practices
+See [docs/TECHNICAL_DESIGN.md](docs/TECHNICAL_DESIGN.md#10-security-considerations) for full IAM policies including optional features.
 
-- ✅ Use IAM roles instead of access keys when possible
-- ✅ Enable CloudTrail logging for audit trails
-- ✅ Regularly review blocked IPs and patterns
-- ✅ Keep whitelist updated with legitimate IPs
-- ✅ Use separate AWS accounts for dev/prod
-- ✅ Rotate Slack tokens regularly
-- ✅ Monitor script execution logs
+## Documentation
 
-### Reporting Security Issues
+- [CLI Reference Guide](docs/CLI_GUIDE.md) - Complete command-line reference
+- [Technical Design](docs/TECHNICAL_DESIGN.md) - Architecture and implementation details
+- [Contributing Guide](CONTRIBUTING.md) - How to contribute
+- [Security Policy](SECURITY.md) - Security practices and reporting
 
-Please report security vulnerabilities to: security@yourorg.com
+## Contributing
 
-**Do not** open public issues for security vulnerabilities.
+```bash
+# Clone and setup
+git clone https://github.com/davidlu1001/aws-auto-block-attackers.git
+cd aws-auto-block-attackers
+uv sync --all-extras
 
-## 📚 Additional Resources
+# Run tests
+uv run pytest tests/ -v
 
-- [AWS Network ACL Documentation](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html)
-- [ALB Access Logs](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html)
-- [IPInfo API Documentation](https://ipinfo.io/developers)
+# Run linting
+uv run black auto_block_attackers.py slack_client.py
+```
 
-## 💬 Support
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+## Support
 
 - **Issues**: [GitHub Issues](https://github.com/davidlu1001/aws-auto-block-attackers/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/davidlu1001/aws-auto-block-attackers/discussions)
-- **Email**: support@yourorg.com
-
-## 🌟 Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=davidlu1001/aws-auto-block-attackers&type=Date)](https://star-history.com/#davidlu1001/aws-auto-block-attackers&Date)
 
 ---
 
-**Made with ❤️ for the security community**
+**Made with security in mind**

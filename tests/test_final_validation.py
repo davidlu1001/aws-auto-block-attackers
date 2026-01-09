@@ -26,13 +26,15 @@ class TestAWSIPFiltering(unittest.TestCase):
 
     def test_load_aws_ip_ranges_none(self):
         """Test with no file path"""
-        result = load_aws_ip_ranges(None)
-        self.assertEqual(result, set())
+        ipv4_result, ipv6_result = load_aws_ip_ranges(None)
+        self.assertEqual(ipv4_result, set())
+        self.assertEqual(ipv6_result, set())
 
     def test_load_aws_ip_ranges_missing_file(self):
         """Test with non-existent file"""
-        result = load_aws_ip_ranges("/nonexistent/file.json")
-        self.assertEqual(result, set())
+        ipv4_result, ipv6_result = load_aws_ip_ranges("/nonexistent/file.json")
+        self.assertEqual(ipv4_result, set())
+        self.assertEqual(ipv6_result, set())
 
     def test_load_aws_ip_ranges_valid(self):
         """Test loading valid AWS IP ranges"""
@@ -54,9 +56,11 @@ class TestAWSIPFiltering(unittest.TestCase):
             temp_file = f.name
 
         try:
-            result = load_aws_ip_ranges(temp_file)
-            self.assertEqual(len(result), 3)
-            self.assertIsInstance(list(result)[0], ipaddress.IPv4Network)
+            ipv4_result, ipv6_result = load_aws_ip_ranges(temp_file)
+            self.assertEqual(len(ipv4_result), 3)
+            self.assertIsInstance(list(ipv4_result)[0], ipaddress.IPv4Network)
+            # No IPv6 prefixes in test data
+            self.assertEqual(len(ipv6_result), 0)
         finally:
             os.unlink(temp_file)
 

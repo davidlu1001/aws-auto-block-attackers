@@ -112,7 +112,7 @@ Documentation:
     See README.md for detailed documentation and examples
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __author__ = "AWS Auto Block Attackers Contributors"
 __license__ = "MIT"
 
@@ -126,6 +126,7 @@ import logging
 import argparse
 from datetime import datetime, timedelta, timezone
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ipaddress
 import fnmatch
@@ -136,11 +137,32 @@ import ipinfo
 
 # Import SlackClient from the same directory
 try:
-    from slack_client import SlackClient
+    from slack_client import SlackClient, SlackSeverity, TIER_TO_SEVERITY
 except ImportError:
     # If running from a different directory
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from slack_client import SlackClient
+    from slack_client import SlackClient, SlackSeverity, TIER_TO_SEVERITY
+
+# Import storage backends
+try:
+    from storage_backends import (
+        StorageBackend,
+        LocalFileBackend,
+        DynamoDBBackend,
+        S3Backend,
+        create_storage_backend,
+        StorageError,
+    )
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from storage_backends import (
+        StorageBackend,
+        LocalFileBackend,
+        DynamoDBBackend,
+        S3Backend,
+        create_storage_backend,
+        StorageError,
+    )
 
 # --- ENHANCED REGULAR EXPRESSIONS TO DETECT COMMON ATTACK PATTERNS ---
 # FIX: All patterns are now combined into a single string separated by '|'
@@ -162,6 +184,140 @@ ATTACK_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# --- KNOWN MALICIOUS USER AGENTS ---
+SCANNER_USER_AGENTS = re.compile(
+    r"(zgrab|nmap|nikto|sqlmap|dirbuster|gobuster|nuclei|wpscan|"
+    r"masscan|shodan|censys|zmap|httpx|feroxbuster|ffuf|"
+    r"python-requests|go-http-client|curl/|wget/|"
+    r"scanner|crawler|spider|bot|scraper|"
+    r"java/\d|libwww-perl|lwp-trivial)",
+    re.IGNORECASE,
+)
+
+# --- MULTI-SIGNAL THREAT DETECTION CONFIGURATION ---
+DEFAULT_THREAT_SIGNALS_CONFIG = {
+    # Weights for different threat signals (sum should ideally be around 100)
+    "attack_pattern_weight": 40,  # Pattern match in request
+    "scanner_ua_weight": 25,  # Known scanner user agent
+    "error_rate_weight": 20,  # High 4xx/5xx response rate
+    "path_diversity_weight": 10,  # Many unique paths (scanning behavior)
+    "rate_weight": 5,  # High request rate
+
+    # Thresholds
+    "error_rate_threshold": 0.7,  # 70% error responses
+    "path_diversity_threshold": 0.8,  # 80% unique paths
+    "rate_threshold": 100,  # 100+ requests in time window
+
+    # Minimum score to be considered malicious (out of 100)
+    "min_threat_score": 40,
+
+    # Enable/disable multi-signal mode
+    "enabled": True,
+}
+
+
+class ThreatSignals:
+    """
+    Tracks multiple threat signals for an IP address.
+    Used for multi-signal threat detection to reduce false positives.
+    """
+
+    def __init__(self):
+        self.attack_pattern_hits: int = 0
+        self.scanner_ua_hits: int = 0
+        self.error_responses: int = 0  # 4xx/5xx responses
+        self.total_requests: int = 0
+        self.unique_paths: Set[str] = set()
+        self.first_seen: Optional[datetime] = None
+        self.last_seen: Optional[datetime] = None
+
+    def add_request(
+        self,
+        has_attack_pattern: bool,
+        has_scanner_ua: bool,
+        status_code: int,
+        path: str,
+        timestamp: Optional[datetime] = None,
+    ):
+        """Record a request and its signals."""
+        self.total_requests += 1
+
+        if has_attack_pattern:
+            self.attack_pattern_hits += 1
+
+        if has_scanner_ua:
+            self.scanner_ua_hits += 1
+
+        if status_code >= 400:
+            self.error_responses += 1
+
+        self.unique_paths.add(path)
+
+        if timestamp:
+            if self.first_seen is None or timestamp < self.first_seen:
+                self.first_seen = timestamp
+            if self.last_seen is None or timestamp > self.last_seen:
+                self.last_seen = timestamp
+
+    def calculate_threat_score(self, config: Dict) -> Tuple[float, Dict[str, float]]:
+        """
+        Calculate overall threat score based on multiple signals.
+
+        Returns:
+            Tuple of (total_score, breakdown_dict)
+        """
+        if self.total_requests == 0:
+            return 0.0, {}
+
+        breakdown = {}
+
+        # 1. Attack pattern signal
+        pattern_ratio = self.attack_pattern_hits / self.total_requests
+        pattern_score = pattern_ratio * config["attack_pattern_weight"]
+        breakdown["attack_pattern"] = pattern_score
+
+        # 2. Scanner user agent signal
+        scanner_ratio = self.scanner_ua_hits / self.total_requests
+        scanner_score = scanner_ratio * config["scanner_ua_weight"]
+        breakdown["scanner_ua"] = scanner_score
+
+        # 3. Error response rate signal
+        error_ratio = self.error_responses / self.total_requests
+        if error_ratio >= config["error_rate_threshold"]:
+            error_score = config["error_rate_weight"]
+        else:
+            error_score = (error_ratio / config["error_rate_threshold"]) * config["error_rate_weight"]
+        breakdown["error_rate"] = error_score
+
+        # 4. Path diversity signal (scanning behavior)
+        path_diversity = len(self.unique_paths) / self.total_requests if self.total_requests > 0 else 0
+        if path_diversity >= config["path_diversity_threshold"]:
+            diversity_score = config["path_diversity_weight"]
+        else:
+            diversity_score = (path_diversity / config["path_diversity_threshold"]) * config["path_diversity_weight"]
+        breakdown["path_diversity"] = diversity_score
+
+        # 5. Request rate signal
+        if self.total_requests >= config["rate_threshold"]:
+            rate_score = config["rate_weight"]
+        else:
+            rate_score = (self.total_requests / config["rate_threshold"]) * config["rate_weight"]
+        breakdown["rate"] = rate_score
+
+        total_score = sum(breakdown.values())
+        return total_score, breakdown
+
+    def is_malicious(self, config: Dict) -> Tuple[bool, float, Dict[str, float]]:
+        """
+        Determine if this IP should be considered malicious based on threat score.
+
+        Returns:
+            Tuple of (is_malicious, score, breakdown)
+        """
+        score, breakdown = self.calculate_threat_score(config)
+        return score >= config["min_threat_score"], score, breakdown
+
+
 # --- TIERED BLOCKING CONFIGURATION ---
 # Each tier: (min_hits, block_duration, tier_name, priority)
 # Priority: Higher number = higher priority (won't be displaced by lower priority)
@@ -174,15 +330,195 @@ DEFAULT_TIER_CONFIG = [
 ]
 
 
-def setup_logging(debug: bool = False):
-    """Configures logging level."""
+class JsonFormatter(logging.Formatter):
+    """
+    JSON formatter for structured logging (CloudWatch Logs compatible).
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_dict = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno,
+        }
+
+        # Add exception info if present
+        if record.exc_info:
+            log_dict["exception"] = self.formatException(record.exc_info)
+
+        # Add extra fields if provided
+        if hasattr(record, "extra_fields"):
+            log_dict.update(record.extra_fields)
+
+        return json.dumps(log_dict)
+
+
+def setup_logging(debug: bool = False, json_format: bool = False):
+    """
+    Configures logging level and format.
+
+    Args:
+        debug: Enable debug level logging
+        json_format: Use JSON structured logging format (for CloudWatch Logs)
+    """
     log_level = logging.DEBUG if debug else logging.INFO
-    # Force reconfiguration even if basicConfig was already called
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        force=True,  # Python 3.8+ - forces reconfiguration
-    )
+
+    # Remove all existing handlers
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Create console handler
+    handler = logging.StreamHandler()
+    handler.setLevel(log_level)
+
+    if json_format:
+        handler.setFormatter(JsonFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+
+    root_logger.setLevel(log_level)
+    root_logger.addHandler(handler)
+
+
+class CloudWatchMetrics:
+    """
+    CloudWatch metrics publisher for monitoring the blocker's activity.
+
+    Publishes custom metrics to AWS CloudWatch for:
+    - IPs blocked/unblocked
+    - Attack patterns detected
+    - Processing performance
+    - Error rates
+    """
+
+    def __init__(
+        self,
+        namespace: str = "AutoBlockAttackers",
+        region: str = "us-east-1",
+        enabled: bool = True,
+        dry_run: bool = False,
+    ):
+        """
+        Initialize CloudWatch metrics publisher.
+
+        Args:
+            namespace: CloudWatch metrics namespace
+            region: AWS region
+            enabled: Whether to publish metrics
+            dry_run: If True, log metrics instead of publishing
+        """
+        self.namespace = namespace
+        self.enabled = enabled
+        self.dry_run = dry_run
+        self._metric_buffer: List[Dict] = []
+        self._buffer_size = 20  # AWS CloudWatch limit per API call
+        self._cloudwatch = None
+
+        if enabled:
+            try:
+                boto_config = Config(
+                    connect_timeout=5,
+                    read_timeout=10,
+                    retries={"max_attempts": 3, "mode": "adaptive"},
+                )
+                self._cloudwatch = boto3.client(
+                    "cloudwatch", region_name=region, config=boto_config
+                )
+                logging.info(f"CloudWatch metrics enabled (namespace: {namespace})")
+            except Exception as e:
+                logging.warning(f"Failed to initialize CloudWatch metrics: {e}")
+                self.enabled = False
+
+    def put_metric(
+        self,
+        metric_name: str,
+        value: float,
+        unit: str = "Count",
+        dimensions: Optional[Dict[str, str]] = None,
+    ):
+        """
+        Queue a metric for publishing to CloudWatch.
+
+        Args:
+            metric_name: Name of the metric
+            value: Metric value
+            unit: Metric unit (Count, Seconds, Bytes, etc.)
+            dimensions: Optional dimension key-value pairs
+        """
+        if not self.enabled:
+            return
+
+        metric_data = {
+            "MetricName": metric_name,
+            "Value": value,
+            "Unit": unit,
+            "Timestamp": datetime.now(timezone.utc),
+        }
+
+        if dimensions:
+            metric_data["Dimensions"] = [
+                {"Name": k, "Value": v} for k, v in dimensions.items()
+            ]
+
+        self._metric_buffer.append(metric_data)
+
+        # Flush if buffer is full
+        if len(self._metric_buffer) >= self._buffer_size:
+            self.flush()
+
+    def put_count(
+        self,
+        metric_name: str,
+        count: int = 1,
+        dimensions: Optional[Dict[str, str]] = None,
+    ):
+        """Convenience method for count metrics."""
+        self.put_metric(metric_name, float(count), "Count", dimensions)
+
+    def put_timing(
+        self,
+        metric_name: str,
+        seconds: float,
+        dimensions: Optional[Dict[str, str]] = None,
+    ):
+        """Convenience method for timing metrics in seconds."""
+        self.put_metric(metric_name, seconds, "Seconds", dimensions)
+
+    def flush(self):
+        """Publish all buffered metrics to CloudWatch."""
+        if not self._metric_buffer:
+            return
+
+        if self.dry_run:
+            logging.debug(
+                f"[DRY-RUN] Would publish {len(self._metric_buffer)} metrics to CloudWatch"
+            )
+            self._metric_buffer.clear()
+            return
+
+        if not self.enabled or not self._cloudwatch:
+            self._metric_buffer.clear()
+            return
+
+        try:
+            # Split into chunks of 20 (AWS limit)
+            for i in range(0, len(self._metric_buffer), self._buffer_size):
+                chunk = self._metric_buffer[i : i + self._buffer_size]
+                self._cloudwatch.put_metric_data(
+                    Namespace=self.namespace, MetricData=chunk
+                )
+            logging.debug(f"Published {len(self._metric_buffer)} metrics to CloudWatch")
+        except ClientError as e:
+            logging.warning(f"Failed to publish CloudWatch metrics: {e}")
+        finally:
+            self._metric_buffer.clear()
 
 
 def is_valid_public_ipv4(ip_str: str) -> bool:
@@ -201,54 +537,128 @@ def is_valid_public_ipv4(ip_str: str) -> bool:
         return False
 
 
-def load_aws_ip_ranges(file_path: Optional[str]) -> Set[ipaddress.IPv4Network]:
+def is_valid_public_ip(ip_str: str) -> Tuple[bool, int]:
+    """
+    Checks if a string is a valid, public IP address (IPv4 or IPv6).
+
+    Args:
+        ip_str: String representation of an IP address
+
+    Returns:
+        Tuple of (is_valid, version) where version is 4 or 6.
+        Returns (False, 0) for invalid addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Check if it's a public IP (not private, loopback, etc.)
+        is_public = (
+            not ip.is_private
+            and not ip.is_loopback
+            and not ip.is_link_local
+            and not ip.is_multicast
+            and not ip.is_reserved
+        )
+
+        # Additional check for IPv6 site-local addresses (deprecated but still exist)
+        if ip.version == 6:
+            # Check for unique local addresses (fc00::/7) - similar to private IPv4
+            if ip_str.lower().startswith(('fc', 'fd')):
+                is_public = False
+
+        return (is_public, ip.version) if is_public else (False, ip.version)
+    except ValueError:
+        return (False, 0)
+
+
+def load_aws_ip_ranges(
+    file_path: Optional[str],
+) -> Tuple[Set[ipaddress.IPv4Network], Set[ipaddress.IPv6Network]]:
     """
     Loads AWS IP ranges from ip-ranges.json file.
-    Returns a set of IPv4Network objects for efficient IP membership testing.
+
+    Args:
+        file_path: Path to the AWS ip-ranges.json file
+
+    Returns:
+        Tuple of (IPv4 networks set, IPv6 networks set) for efficient IP membership testing.
     """
     if not file_path:
-        return set()
+        return set(), set()
 
     try:
         json_path = Path(file_path)
         if not json_path.exists():
             logging.warning(f"AWS IP ranges file not found: {file_path}")
-            return set()
+            return set(), set()
 
         with open(json_path, "r") as f:
             data = json.load(f)
 
-        aws_networks = set()
+        aws_ipv4_networks = set()
+        aws_ipv6_networks = set()
+
+        # Load IPv4 prefixes
         for prefix in data.get("prefixes", []):
             ip_prefix = prefix.get("ip_prefix")
             if ip_prefix and "/" in ip_prefix:
                 try:
                     network = ipaddress.ip_network(ip_prefix, strict=False)
-                    if network.version == 4:  # Only IPv4
-                        aws_networks.add(network)
+                    if network.version == 4:
+                        aws_ipv4_networks.add(network)
                 except ValueError:
                     continue
 
-        logging.info(f"Loaded {len(aws_networks)} AWS IPv4 ranges from {file_path}")
-        return aws_networks
+        # Load IPv6 prefixes
+        for prefix in data.get("ipv6_prefixes", []):
+            ip_prefix = prefix.get("ipv6_prefix")
+            if ip_prefix and "/" in ip_prefix:
+                try:
+                    network = ipaddress.ip_network(ip_prefix, strict=False)
+                    if network.version == 6:
+                        aws_ipv6_networks.add(network)
+                except ValueError:
+                    continue
+
+        logging.info(
+            f"Loaded {len(aws_ipv4_networks)} AWS IPv4 and {len(aws_ipv6_networks)} AWS IPv6 ranges from {file_path}"
+        )
+        return aws_ipv4_networks, aws_ipv6_networks
 
     except Exception as e:
         logging.warning(f"Error loading AWS IP ranges from {file_path}: {e}")
-        return set()
+        return set(), set()
 
 
-def is_aws_ip(ip_str: str, aws_networks: Set[ipaddress.IPv4Network]) -> bool:
+def is_aws_ip(
+    ip_str: str,
+    aws_ipv4_networks: Set[ipaddress.IPv4Network],
+    aws_ipv6_networks: Optional[Set[ipaddress.IPv6Network]] = None,
+) -> bool:
     """
     Checks if an IP address belongs to AWS IP ranges.
-    Uses early termination for efficiency.
-    """
-    if not aws_networks:
-        return False
 
+    Args:
+        ip_str: IP address string to check
+        aws_ipv4_networks: Set of AWS IPv4 networks
+        aws_ipv6_networks: Optional set of AWS IPv6 networks
+
+    Returns:
+        True if the IP belongs to AWS, False otherwise.
+    """
     try:
         ip = ipaddress.ip_address(ip_str)
-        # Iterate through networks - will return True immediately on first match
-        return any(ip in network for network in aws_networks)
+
+        if ip.version == 4:
+            if not aws_ipv4_networks:
+                return False
+            return any(ip in network for network in aws_ipv4_networks)
+        elif ip.version == 6:
+            if not aws_ipv6_networks:
+                return False
+            return any(ip in network for network in aws_ipv6_networks)
+
+        return False
     except ValueError:
         return False
 
@@ -275,33 +685,95 @@ class NaclAutoBlocker:
         ipinfo_token: Optional[str] = None,
         registry_file: Optional[str] = None,
         tier_config: Optional[List[Tuple]] = None,
+        storage_backend: Optional[str] = None,
+        dynamodb_table: Optional[str] = None,
+        s3_state_bucket: Optional[str] = None,
+        s3_state_key: Optional[str] = None,
+        create_dynamodb_table: bool = False,
+        # IPv6 support parameters
+        start_rule_ipv6: int = 180,
+        limit_ipv6: int = 20,
+        enable_ipv6: bool = True,
+        # Incremental processing
+        force_reprocess: bool = False,
+        # AWS WAF IP Set integration
+        waf_ip_set_name: Optional[str] = None,
+        waf_ip_set_scope: str = "REGIONAL",  # "REGIONAL" or "CLOUDFRONT"
+        waf_ip_set_id: Optional[str] = None,
+        create_waf_ip_set: bool = False,
+        # Structured logging & CloudWatch metrics
+        json_logging: bool = False,
+        enable_cloudwatch_metrics: bool = False,
+        cloudwatch_namespace: str = "AutoBlockAttackers",
+        # Multi-signal threat detection
+        enable_multi_signal: bool = True,
+        threat_signals_config: Optional[Dict] = None,
+        # Enhanced Slack notifications
+        enhanced_slack: bool = False,
     ):
-        setup_logging(debug)
+        setup_logging(debug, json_format=json_logging)
         logging.info("Initializing NaclAutoBlocker...")
+
+        # Multi-signal threat detection configuration
+        self._enable_multi_signal = enable_multi_signal
+        self._threat_signals_config = threat_signals_config or DEFAULT_THREAT_SIGNALS_CONFIG.copy()
+        if enable_multi_signal:
+            logging.info(
+                f"Multi-signal threat detection enabled (min score: {self._threat_signals_config['min_threat_score']})"
+            )
         self.lb_name_pattern = lb_name_pattern
         self.region = region
         self.lookback_delta = self._parse_lookback_period(lookback_str)
         self.threshold = threshold
-        # Calculate end rule based on start_rule and limit
+
+        # IPv4 NACL rule range
         end_rule = min(start_rule + limit, 100)
-        self.deny_rule_range = range(start_rule, end_rule)  # Managed DENY rules
+        self.deny_rule_range = range(start_rule, end_rule)  # Managed IPv4 DENY rules
         self.nacl_limit = limit
+
+        # IPv6 NACL rule range (separate from IPv4)
+        self.enable_ipv6 = enable_ipv6
+        end_rule_ipv6 = min(start_rule_ipv6 + limit_ipv6, 200)
+        self.deny_rule_range_ipv6 = range(start_rule_ipv6, end_rule_ipv6)
+        self.nacl_limit_ipv6 = limit_ipv6
+
+        if enable_ipv6:
+            logging.info(f"IPv6 blocking enabled: rules {start_rule_ipv6}-{end_rule_ipv6 - 1}")
+
         logging.info("Loading whitelist and AWS IP ranges...")
         self.whitelist = self._load_whitelist(whitelist_file)
-        self.aws_networks = load_aws_ip_ranges(aws_ip_ranges_file)
+
+        # Load both IPv4 and IPv6 AWS networks
+        self.aws_ipv4_networks, self.aws_ipv6_networks = load_aws_ip_ranges(aws_ip_ranges_file)
+        # Keep backward compatibility
+        self.aws_networks = self.aws_ipv4_networks
+
         self.dry_run = dry_run
 
         # Block registry for persistent time-based blocking
         self.registry_file = registry_file or "./block_registry.json"
         self.tier_config = tier_config or DEFAULT_TIER_CONFIG
         self.block_registry: Dict[str, Dict] = {}
-        logging.info(f"Using block registry file: {self.registry_file}")
+
+        # Initialize storage backend
+        self._storage_backend_type = storage_backend or "local"
+        self._storage_backend = self._init_storage_backend(
+            backend_type=self._storage_backend_type,
+            registry_file=self.registry_file,
+            dynamodb_table=dynamodb_table,
+            s3_bucket=s3_state_bucket,
+            s3_key=s3_state_key or "block_registry.json",
+            region=region,
+            create_dynamodb_table=create_dynamodb_table,
+        )
         self._load_block_registry()
 
         # Initialize Slack client if credentials provided
         self.slack_client = None
+        self._enhanced_slack = enhanced_slack
         if slack_token and slack_channel:
-            logging.info("Initializing Slack notifications...")
+            notification_type = "enhanced" if enhanced_slack else "basic"
+            logging.info(f"Initializing Slack notifications ({notification_type})...")
             self.slack_client = SlackClient(token=slack_token, channel=slack_channel)
         elif slack_token or slack_channel:
             logging.warning(
@@ -318,14 +790,73 @@ class NaclAutoBlocker:
         else:
             logging.info("No IPInfo token provided. IP geolocation disabled.")
 
+        # IPInfo circuit breaker state
+        self._ipinfo_failures = 0
+        self._ipinfo_circuit_open = False
+        self._ipinfo_failure_threshold = 3
+
+        # Failed Slack messages queue for retry
+        self._failed_slack_messages: List[Tuple[str, bool]] = []
+
+        # S3 processing error tracking
+        self._s3_processing_errors = 0
+
+        # Incremental log processing state
+        self._force_reprocess = force_reprocess
+        self._processed_files: Dict[str, str] = {}  # key -> etag
+        self._processed_files_cache_key = "_processed_files_cache"
+        self._skipped_files_count = 0
+        self._new_files_count = 0
+
+        # Load processed files cache (only if not force_reprocess)
+        if not force_reprocess:
+            self._load_processed_files_cache()
+        else:
+            logging.info("Force reprocess enabled - ignoring processed files cache")
+
         logging.info("Initializing AWS clients (boto3)...")
+        # Enhanced boto config with adaptive retries for production stability
         boto_config = Config(
-            connect_timeout=10, read_timeout=15, retries={"max_attempts": 3}
+            connect_timeout=10,
+            read_timeout=30,
+            retries={
+                "max_attempts": 5,
+                "mode": "adaptive",  # Exponential backoff with jitter
+            },
         )
         self.ec2 = boto3.client("ec2", region_name=self.region, config=boto_config)
         self.elbv2 = boto3.client("elbv2", region_name=self.region, config=boto_config)
         self.s3 = boto3.client("s3", region_name=self.region, config=boto_config)
         self.sts = boto3.client("sts", region_name=self.region, config=boto_config)
+
+        # AWS WAF IP Set integration
+        self._waf_ip_set_name = waf_ip_set_name
+        self._waf_ip_set_scope = waf_ip_set_scope.upper()
+        self._waf_ip_set_id = waf_ip_set_id
+        self._create_waf_ip_set = create_waf_ip_set
+        self._waf_enabled = bool(waf_ip_set_name or waf_ip_set_id)
+        self._waf_ip_set_lock_token: Optional[str] = None
+        self._waf_max_addresses = 10000  # AWS WAF limit per IP set
+
+        if self._waf_enabled:
+            # CloudFront WAF must use us-east-1 region
+            waf_region = "us-east-1" if self._waf_ip_set_scope == "CLOUDFRONT" else self.region
+            self.wafv2 = boto3.client("wafv2", region_name=waf_region, config=boto_config)
+            logging.info(
+                f"AWS WAF integration enabled (scope: {self._waf_ip_set_scope}, region: {waf_region})"
+            )
+            self._init_waf_ip_set()
+        else:
+            self.wafv2 = None
+
+        # Initialize CloudWatch metrics
+        self._metrics = CloudWatchMetrics(
+            namespace=cloudwatch_namespace,
+            region=self.region,
+            enabled=enable_cloudwatch_metrics,
+            dry_run=dry_run,
+        )
+
         logging.info("Initialization complete. Ready to run.")
 
     def _parse_lookback_period(self, lookback_str: str) -> timedelta:
@@ -341,6 +872,52 @@ class NaclAutoBlocker:
             return timedelta(hours=value)
         else:  # unit == "d"
             return timedelta(days=value)
+
+    def _init_storage_backend(
+        self,
+        backend_type: str,
+        registry_file: str,
+        dynamodb_table: Optional[str],
+        s3_bucket: Optional[str],
+        s3_key: str,
+        region: str,
+        create_dynamodb_table: bool,
+    ) -> StorageBackend:
+        """
+        Initialize the appropriate storage backend based on configuration.
+
+        Args:
+            backend_type: Type of backend ('local', 'dynamodb', 's3')
+            registry_file: Path to local registry file
+            dynamodb_table: DynamoDB table name
+            s3_bucket: S3 bucket name
+            s3_key: S3 object key
+            region: AWS region
+            create_dynamodb_table: Whether to create DynamoDB table if missing
+
+        Returns:
+            StorageBackend: Configured storage backend instance
+        """
+        try:
+            backend = create_storage_backend(
+                backend_type=backend_type,
+                local_file=registry_file,
+                dynamodb_table=dynamodb_table,
+                s3_bucket=s3_bucket,
+                s3_key=s3_key,
+                region=region,
+                create_dynamodb_table=create_dynamodb_table,
+            )
+            logging.info(f"Storage backend initialized: {backend_type}")
+            return backend
+        except ValueError as e:
+            logging.error(f"Invalid storage backend configuration: {e}")
+            raise
+        except Exception as e:
+            logging.error(f"Failed to initialize storage backend: {e}")
+            # Fall back to local storage
+            logging.warning("Falling back to local file storage")
+            return LocalFileBackend(file_path=registry_file)
 
     def _load_whitelist(self, file_path: Optional[str]) -> Set[str]:
         if not file_path:
@@ -361,50 +938,28 @@ class NaclAutoBlocker:
             return set()
 
     def _load_block_registry(self):
-        """Loads the block registry from JSON file. Creates new if not exists or corrupted."""
+        """Loads the block registry from the configured storage backend."""
         try:
-            if os.path.exists(self.registry_file):
-                with open(self.registry_file, "r") as f:
-                    data = json.load(f)
-                    # Validate structure
-                    if isinstance(data, dict):
-                        self.block_registry = data
-                        logging.info(
-                            f"Loaded block registry with {len(self.block_registry)} IPs"
-                        )
-                    else:
-                        logging.warning(
-                            "Block registry has invalid structure. Starting fresh."
-                        )
-                        self.block_registry = {}
-            else:
-                logging.info(
-                    "Block registry file not found. Starting with empty registry."
-                )
-                self.block_registry = {}
-        except json.JSONDecodeError as e:
-            logging.warning(f"Block registry JSON is corrupted: {e}. Starting fresh.")
+            self.block_registry = self._storage_backend.load()
+            logging.info(f"Loaded block registry with {len(self.block_registry)} IPs")
+        except StorageError as e:
+            logging.warning(f"Storage backend error: {e}. Starting fresh.")
             self.block_registry = {}
         except Exception as e:
             logging.warning(f"Error loading block registry: {e}. Starting fresh.")
             self.block_registry = {}
 
     def _save_block_registry(self):
-        """Saves the block registry to JSON file."""
+        """Saves the block registry to the configured storage backend."""
         if self.dry_run:
-            logging.info("[DRY RUN] Would save block registry to file")
+            logging.info("[DRY RUN] Would save block registry")
             return
 
         try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(self.registry_file), exist_ok=True)
-
-            # Write to temp file first, then atomic rename
-            temp_file = f"{self.registry_file}.tmp"
-            with open(temp_file, "w") as f:
-                json.dump(self.block_registry, f, indent=2, default=str)
-            os.rename(temp_file, self.registry_file)
+            self._storage_backend.save(self.block_registry)
             logging.info(f"Saved block registry with {len(self.block_registry)} IPs")
+        except StorageError as e:
+            logging.error(f"Storage backend error saving registry: {e}")
         except Exception as e:
             logging.error(f"Failed to save block registry: {e}")
 
@@ -423,8 +978,16 @@ class NaclAutoBlocker:
         """Gets registry entry for an IP, returns None if not found."""
         return self.block_registry.get(ip)
 
-    def _update_registry_entry(self, ip: str, hit_count: int, now: datetime):
-        """Updates or creates a registry entry for an IP."""
+    def _update_registry_entry(self, ip: str, hit_count: int, now: datetime, ip_version: int = 4):
+        """
+        Updates or creates a registry entry for an IP.
+
+        Args:
+            ip: IP address to register
+            hit_count: Number of malicious hits
+            now: Current UTC datetime
+            ip_version: IP version (4 or 6)
+        """
         tier_name, duration, priority = self._determine_tier(hit_count)
         block_until = now + duration
 
@@ -434,6 +997,8 @@ class NaclAutoBlocker:
             old_tier = existing.get("tier", "unknown")
             old_priority = existing.get("priority", 0)
             old_block_until = existing.get("block_until")
+            # Preserve IP version from existing entry if not explicitly set
+            existing_version = existing.get("ip_version", ip_version)
 
             # Keep the earlier first_seen timestamp
             first_seen = existing.get("first_seen", now.isoformat())
@@ -441,7 +1006,7 @@ class NaclAutoBlocker:
             # Only extend block time if tier upgraded (priority increased)
             if priority > old_priority:
                 logging.info(
-                    f"Upgrading {ip} from {old_tier} to {tier_name} tier - extending block duration"
+                    f"Upgrading {ip} (v{ip_version}) from {old_tier} to {tier_name} tier - extending block duration"
                 )
                 # Tier upgraded - reset block time with new duration
                 final_block_until = block_until.isoformat()
@@ -461,9 +1026,11 @@ class NaclAutoBlocker:
                 "priority": priority,
                 "block_until": final_block_until,
                 "block_duration_hours": duration.total_seconds() / 3600,
+                "ip_version": existing_version,
             }
         else:
             # Create new entry
+            logging.info(f"New block for {ip} (IPv{ip_version}): tier={tier_name}, hits={hit_count}")
             self.block_registry[ip] = {
                 "first_seen": now.isoformat(),
                 "last_seen": now.isoformat(),
@@ -472,12 +1039,512 @@ class NaclAutoBlocker:
                 "priority": priority,
                 "block_until": block_until.isoformat(),
                 "block_duration_hours": duration.total_seconds() / 3600,
+                "ip_version": ip_version,
             }
 
     def _remove_registry_entry(self, ip: str):
         """Removes an IP from the registry."""
         if ip in self.block_registry:
             del self.block_registry[ip]
+
+    def _load_processed_files_cache(self):
+        """
+        Load the processed files cache from storage backend.
+        Uses a special key prefix to store alongside block registry.
+        """
+        try:
+            if self._storage_backend_type == "local":
+                # Store in a separate file for local backend
+                cache_file = self.registry_file.replace(".json", "_processed.json")
+                if os.path.exists(cache_file):
+                    with open(cache_file, "r") as f:
+                        self._processed_files = json.load(f)
+                        logging.debug(f"Loaded {len(self._processed_files)} processed file records")
+            else:
+                # For cloud backends, retrieve from storage
+                cached = self._storage_backend.get(self._processed_files_cache_key)
+                if cached and isinstance(cached.get("files"), dict):
+                    self._processed_files = cached["files"]
+                    logging.debug(f"Loaded {len(self._processed_files)} processed file records")
+        except Exception as e:
+            logging.warning(f"Failed to load processed files cache: {e}")
+            self._processed_files = {}
+
+    def _save_processed_files_cache(self):
+        """Save the processed files cache to storage backend."""
+        if self.dry_run:
+            logging.debug("[DRY RUN] Would save processed files cache")
+            return
+
+        try:
+            if self._storage_backend_type == "local":
+                cache_file = self.registry_file.replace(".json", "_processed.json")
+                with open(cache_file, "w") as f:
+                    json.dump(self._processed_files, f, indent=2)
+            else:
+                self._storage_backend.put(
+                    self._processed_files_cache_key,
+                    {
+                        "files": self._processed_files,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            logging.debug(f"Saved {len(self._processed_files)} processed file records")
+        except Exception as e:
+            logging.warning(f"Failed to save processed files cache: {e}")
+
+    def _cleanup_old_processed_files(self, lookback_hours: float):
+        """
+        Remove processed file records older than 2x lookback period.
+
+        Args:
+            lookback_hours: Current lookback period in hours
+        """
+        if not self._processed_files:
+            return
+
+        now = datetime.now(timezone.utc)
+        cutoff_hours = lookback_hours * 2  # Keep records for 2x lookback
+
+        keys_to_remove = []
+        for key, data in self._processed_files.items():
+            try:
+                # Parse the processed_at timestamp if it exists
+                if isinstance(data, dict):
+                    processed_at_str = data.get("processed_at")
+                    if processed_at_str:
+                        processed_at = datetime.fromisoformat(processed_at_str)
+                        if processed_at.tzinfo is None:
+                            processed_at = processed_at.replace(tzinfo=timezone.utc)
+                        age_hours = (now - processed_at).total_seconds() / 3600
+                        if age_hours > cutoff_hours:
+                            keys_to_remove.append(key)
+            except Exception:
+                pass
+
+        for key in keys_to_remove:
+            del self._processed_files[key]
+
+        if keys_to_remove:
+            logging.info(f"Cleaned up {len(keys_to_remove)} old processed file records")
+
+    def _is_file_already_processed(self, bucket: str, key: str, etag: str) -> bool:
+        """
+        Check if a file has already been processed (based on ETag).
+
+        Args:
+            bucket: S3 bucket name
+            key: S3 object key
+            etag: S3 object ETag
+
+        Returns:
+            True if file was already processed with same ETag
+        """
+        if self._force_reprocess:
+            return False
+
+        cache_key = f"{bucket}:{key}"
+        cached = self._processed_files.get(cache_key)
+
+        if cached:
+            if isinstance(cached, dict):
+                return cached.get("etag") == etag
+            else:
+                # Backward compatibility: cached value is just the etag
+                return cached == etag
+
+        return False
+
+    def _mark_file_processed(self, bucket: str, key: str, etag: str):
+        """
+        Mark a file as processed.
+
+        Args:
+            bucket: S3 bucket name
+            key: S3 object key
+            etag: S3 object ETag
+        """
+        cache_key = f"{bucket}:{key}"
+        self._processed_files[cache_key] = {
+            "etag": etag,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # -------------------------------------------------------------------------
+    # AWS WAF IP Set Integration Methods
+    # -------------------------------------------------------------------------
+
+    def _init_waf_ip_set(self):
+        """
+        Initialize AWS WAF IP Set - find existing or create new if configured.
+        """
+        if not self._waf_enabled:
+            return
+
+        try:
+            # If IP Set ID is provided, verify it exists
+            if self._waf_ip_set_id:
+                ip_set = self._get_waf_ip_set_by_id(self._waf_ip_set_id)
+                if ip_set:
+                    self._waf_ip_set_name = ip_set.get("Name", self._waf_ip_set_name)
+                    logging.info(f"Using existing WAF IP Set: {self._waf_ip_set_name} ({self._waf_ip_set_id})")
+                    return
+                else:
+                    logging.error(f"WAF IP Set ID {self._waf_ip_set_id} not found")
+                    self._waf_enabled = False
+                    return
+
+            # Search by name
+            if self._waf_ip_set_name:
+                ip_set_id = self._find_waf_ip_set_by_name(self._waf_ip_set_name)
+                if ip_set_id:
+                    self._waf_ip_set_id = ip_set_id
+                    logging.info(f"Found existing WAF IP Set: {self._waf_ip_set_name} ({ip_set_id})")
+                    return
+
+                # Create new IP set if requested
+                if self._create_waf_ip_set:
+                    self._create_waf_ip_set_resource()
+                else:
+                    logging.warning(
+                        f"WAF IP Set '{self._waf_ip_set_name}' not found. "
+                        "Use --create-waf-ip-set to create it."
+                    )
+                    self._waf_enabled = False
+
+        except ClientError as e:
+            logging.error(f"Error initializing WAF IP Set: {e}")
+            self._waf_enabled = False
+
+    def _get_waf_ip_set_by_id(self, ip_set_id: str) -> Optional[Dict]:
+        """
+        Get WAF IP Set details by ID.
+
+        Args:
+            ip_set_id: The WAF IP Set ID
+
+        Returns:
+            IP Set details dict or None if not found
+        """
+        try:
+            response = self.wafv2.get_ip_set(
+                Name=self._waf_ip_set_name or "unknown",
+                Scope=self._waf_ip_set_scope,
+                Id=ip_set_id,
+            )
+            self._waf_ip_set_lock_token = response.get("LockToken")
+            return response.get("IPSet")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "WAFNonexistentItemException":
+                return None
+            raise
+
+    def _find_waf_ip_set_by_name(self, name: str) -> Optional[str]:
+        """
+        Find WAF IP Set by name.
+
+        Args:
+            name: The IP Set name to search for
+
+        Returns:
+            IP Set ID if found, None otherwise
+        """
+        try:
+            paginator = self.wafv2.get_paginator("list_ip_sets")
+            for page in paginator.paginate(Scope=self._waf_ip_set_scope):
+                for ip_set in page.get("IPSets", []):
+                    if ip_set.get("Name") == name:
+                        # Get the full IP set to retrieve lock token
+                        full_ip_set = self.wafv2.get_ip_set(
+                            Name=name,
+                            Scope=self._waf_ip_set_scope,
+                            Id=ip_set["Id"],
+                        )
+                        self._waf_ip_set_lock_token = full_ip_set.get("LockToken")
+                        return ip_set["Id"]
+            return None
+        except ClientError as e:
+            logging.error(f"Error listing WAF IP Sets: {e}")
+            return None
+
+    def _create_waf_ip_set_resource(self):
+        """
+        Create a new WAF IP Set.
+        """
+        if self.dry_run:
+            logging.info(f"[DRY-RUN] Would create WAF IP Set: {self._waf_ip_set_name}")
+            self._waf_enabled = False
+            return
+
+        try:
+            response = self.wafv2.create_ip_set(
+                Name=self._waf_ip_set_name,
+                Scope=self._waf_ip_set_scope,
+                Description=f"Auto-blocked attackers managed by aws-auto-block-attackers (v{__version__})",
+                IPAddressVersion="IPV4",  # We'll handle IPv6 separately if needed
+                Addresses=[],
+                Tags=[
+                    {"Key": "ManagedBy", "Value": "aws-auto-block-attackers"},
+                    {"Key": "Version", "Value": __version__},
+                ],
+            )
+            self._waf_ip_set_id = response["Summary"]["Id"]
+            self._waf_ip_set_lock_token = response["Summary"]["LockToken"]
+            logging.info(f"Created WAF IP Set: {self._waf_ip_set_name} ({self._waf_ip_set_id})")
+
+            # Create IPv6 IP set if enabled
+            if self.enable_ipv6:
+                self._create_waf_ipv6_ip_set()
+
+        except ClientError as e:
+            logging.error(f"Failed to create WAF IP Set: {e}")
+            self._waf_enabled = False
+
+    def _create_waf_ipv6_ip_set(self):
+        """
+        Create a companion IPv6 WAF IP Set.
+        """
+        ipv6_name = f"{self._waf_ip_set_name}-ipv6"
+        try:
+            response = self.wafv2.create_ip_set(
+                Name=ipv6_name,
+                Scope=self._waf_ip_set_scope,
+                Description=f"Auto-blocked IPv6 attackers managed by aws-auto-block-attackers (v{__version__})",
+                IPAddressVersion="IPV6",
+                Addresses=[],
+                Tags=[
+                    {"Key": "ManagedBy", "Value": "aws-auto-block-attackers"},
+                    {"Key": "Version", "Value": __version__},
+                ],
+            )
+            self._waf_ipv6_ip_set_id = response["Summary"]["Id"]
+            self._waf_ipv6_ip_set_lock_token = response["Summary"]["LockToken"]
+            logging.info(f"Created WAF IPv6 IP Set: {ipv6_name} ({self._waf_ipv6_ip_set_id})")
+        except ClientError as e:
+            logging.warning(f"Failed to create WAF IPv6 IP Set: {e}")
+
+    def _get_waf_current_addresses(self) -> Set[str]:
+        """
+        Get current addresses in the WAF IP Set.
+
+        Returns:
+            Set of CIDR addresses currently in the IP set
+        """
+        if not self._waf_enabled or not self._waf_ip_set_id:
+            return set()
+
+        try:
+            response = self.wafv2.get_ip_set(
+                Name=self._waf_ip_set_name,
+                Scope=self._waf_ip_set_scope,
+                Id=self._waf_ip_set_id,
+            )
+            self._waf_ip_set_lock_token = response.get("LockToken")
+            return set(response.get("IPSet", {}).get("Addresses", []))
+        except ClientError as e:
+            logging.error(f"Error getting WAF IP Set addresses: {e}")
+            return set()
+
+    def _sync_waf_ip_set(self, blocked_ips: Set[str]):
+        """
+        Synchronize blocked IPs with WAF IP Set.
+
+        Args:
+            blocked_ips: Set of IPs to block (will be converted to /32 CIDR)
+        """
+        if not self._waf_enabled or not self._waf_ip_set_id:
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # Get active blocks from registry (not expired)
+        active_blocked_ips = set()
+        for ip in blocked_ips:
+            if ip in self.block_registry:
+                data = self.block_registry[ip]
+                block_until_str = data.get("block_until")
+                if block_until_str:
+                    try:
+                        block_until = datetime.fromisoformat(block_until_str)
+                        if block_until.tzinfo is None:
+                            block_until = block_until.replace(tzinfo=timezone.utc)
+                        if now < block_until:
+                            active_blocked_ips.add(ip)
+                    except Exception:
+                        pass
+            else:
+                # New block, include it
+                active_blocked_ips.add(ip)
+
+        # Separate IPv4 and IPv6
+        ipv4_ips = set()
+        ipv6_ips = set()
+
+        for ip in active_blocked_ips:
+            try:
+                ip_obj = ipaddress.ip_address(ip)
+                if ip_obj.version == 4:
+                    ipv4_ips.add(f"{ip}/32")
+                else:
+                    ipv6_ips.add(f"{ip}/128")
+            except ValueError:
+                logging.warning(f"Invalid IP address for WAF sync: {ip}")
+
+        # Sync IPv4 IP Set
+        self._update_waf_ip_set_addresses(ipv4_ips, is_ipv6=False)
+
+        # Sync IPv6 IP Set if we have IPv6 addresses and IPv6 is enabled
+        if ipv6_ips and self.enable_ipv6 and hasattr(self, "_waf_ipv6_ip_set_id"):
+            self._update_waf_ip_set_addresses(ipv6_ips, is_ipv6=True)
+
+    def _update_waf_ip_set_addresses(self, target_addresses: Set[str], is_ipv6: bool = False):
+        """
+        Update WAF IP Set with target addresses (add missing, remove stale).
+
+        Args:
+            target_addresses: Set of CIDR addresses that should be in the IP set
+            is_ipv6: Whether this is for the IPv6 IP set
+        """
+        if is_ipv6:
+            if not hasattr(self, "_waf_ipv6_ip_set_id") or not self._waf_ipv6_ip_set_id:
+                return
+            ip_set_id = self._waf_ipv6_ip_set_id
+            ip_set_name = f"{self._waf_ip_set_name}-ipv6"
+            lock_token_attr = "_waf_ipv6_ip_set_lock_token"
+        else:
+            ip_set_id = self._waf_ip_set_id
+            ip_set_name = self._waf_ip_set_name
+            lock_token_attr = "_waf_ip_set_lock_token"
+
+        try:
+            # Get current addresses
+            response = self.wafv2.get_ip_set(
+                Name=ip_set_name,
+                Scope=self._waf_ip_set_scope,
+                Id=ip_set_id,
+            )
+            current_addresses = set(response.get("IPSet", {}).get("Addresses", []))
+            lock_token = response.get("LockToken")
+            setattr(self, lock_token_attr, lock_token)
+
+            # Calculate changes
+            to_add = target_addresses - current_addresses
+            to_remove = current_addresses - target_addresses
+
+            if not to_add and not to_remove:
+                logging.debug(f"WAF IP Set {ip_set_name} already in sync")
+                return
+
+            # Merge current with changes
+            new_addresses = (current_addresses | to_add) - to_remove
+
+            # Check WAF limits
+            if len(new_addresses) > self._waf_max_addresses:
+                logging.warning(
+                    f"WAF IP Set would exceed {self._waf_max_addresses} addresses. "
+                    f"Truncating to limit."
+                )
+                # Prioritize keeping newer/higher-priority blocks
+                # For simplicity, just truncate (in production, implement smarter logic)
+                new_addresses = set(list(new_addresses)[: self._waf_max_addresses])
+
+            ip_version = "IPv6" if is_ipv6 else "IPv4"
+            if self.dry_run:
+                logging.info(
+                    f"[DRY-RUN] Would update WAF {ip_version} IP Set: "
+                    f"+{len(to_add)} -{len(to_remove)} addresses"
+                )
+                return
+
+            # Update IP set
+            self.wafv2.update_ip_set(
+                Name=ip_set_name,
+                Scope=self._waf_ip_set_scope,
+                Id=ip_set_id,
+                Addresses=list(new_addresses),
+                LockToken=lock_token,
+            )
+
+            logging.info(
+                f"Updated WAF {ip_version} IP Set: +{len(to_add)} -{len(to_remove)} addresses "
+                f"(total: {len(new_addresses)})"
+            )
+
+            # Send Slack notification for significant changes
+            if self.slack_client and (len(to_add) >= 5 or len(to_remove) >= 5):
+                self._send_slack_message(
+                    f"WAF {ip_version} IP Set updated: +{len(to_add)} -{len(to_remove)} addresses "
+                    f"(total: {len(new_addresses)})",
+                    is_error=False,
+                )
+
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code == "WAFOptimisticLockException":
+                logging.warning("WAF IP Set was modified concurrently, retrying...")
+                # Retry once
+                self._update_waf_ip_set_addresses(target_addresses, is_ipv6)
+            else:
+                logging.error(f"Failed to update WAF IP Set: {e}")
+
+    def _cleanup_expired_waf_entries(self, expired_ips: Set[str]):
+        """
+        Remove expired IPs from WAF IP Set.
+
+        Args:
+            expired_ips: Set of IPs whose blocks have expired
+        """
+        if not self._waf_enabled or not expired_ips:
+            return
+
+        # Get current active blocks from registry
+        now = datetime.now(timezone.utc)
+        active_ips = set()
+
+        for ip, data in self.block_registry.items():
+            if ip in expired_ips:
+                continue
+            block_until_str = data.get("block_until")
+            if block_until_str:
+                try:
+                    block_until = datetime.fromisoformat(block_until_str)
+                    if block_until.tzinfo is None:
+                        block_until = block_until.replace(tzinfo=timezone.utc)
+                    if now < block_until:
+                        active_ips.add(ip)
+                except Exception:
+                    pass
+
+        # Sync with remaining active IPs
+        self._sync_waf_ip_set(active_ips)
+
+    def _get_waf_statistics(self) -> Dict:
+        """
+        Get statistics about WAF IP Set usage.
+
+        Returns:
+            Dict with WAF statistics
+        """
+        if not self._waf_enabled:
+            return {"enabled": False}
+
+        stats = {
+            "enabled": True,
+            "scope": self._waf_ip_set_scope,
+            "ip_set_id": self._waf_ip_set_id,
+            "ip_set_name": self._waf_ip_set_name,
+        }
+
+        try:
+            current = self._get_waf_current_addresses()
+            stats["ipv4_count"] = len([a for a in current if "." in a])
+            stats["capacity_used"] = len(current)
+            stats["capacity_max"] = self._waf_max_addresses
+            stats["capacity_percent"] = round(len(current) / self._waf_max_addresses * 100, 1)
+        except Exception as e:
+            stats["error"] = str(e)
+
+        return stats
 
     def _get_expired_blocks(self, now: datetime) -> Set[str]:
         """Returns set of IPs whose blocks have expired."""
@@ -498,6 +1565,11 @@ class NaclAutoBlocker:
 
     def _cleanup_old_registry_entries(self, now: datetime, days_old: int = 30):
         """Remove very old expired entries from registry to prevent unbounded growth."""
+        # For DynamoDB backend, TTL handles cleanup automatically
+        if self._storage_backend_type == "dynamodb":
+            logging.debug("DynamoDB TTL handles automatic cleanup - skipping manual cleanup")
+            return
+
         cutoff_time = now - timedelta(days=days_old)
         old_entries = []
 
@@ -520,6 +1592,12 @@ class NaclAutoBlocker:
             )
             for ip in old_entries:
                 del self.block_registry[ip]
+                # Also delete from storage backend if using S3 (to keep in sync)
+                if self._storage_backend_type == "s3":
+                    try:
+                        self._storage_backend.delete(ip)
+                    except Exception:
+                        pass  # Will be cleaned up on next full save
 
     def _get_active_blocks(self, now: datetime) -> Dict[str, Dict]:
         """Returns dict of IPs that should still be blocked (not expired)."""
@@ -540,11 +1618,24 @@ class NaclAutoBlocker:
 
     def run(self):
         """Executes the entire blocking process."""
+        import time
+
+        run_start_time = time.time()
+
         logging.info(
             "--- Starting Automated Attacker Blocking Script (Tiered Persistence Mode) ---"
         )
         if self.dry_run:
             logging.warning("*** RUNNING IN DRY RUN MODE. NO CHANGES WILL BE MADE. ***")
+
+        # Reset error counters for this run
+        self._s3_processing_errors = 0
+        self._ipinfo_failures = 0
+        self._ipinfo_circuit_open = False
+        self._failed_slack_messages.clear()
+
+        # Track metrics dimensions
+        metrics_dimensions = {"Region": self.region}
 
         now = datetime.now(timezone.utc)
 
@@ -593,46 +1684,126 @@ class NaclAutoBlocker:
             # Now remove from registry
             for ip in expired_ips:
                 self._remove_registry_entry(ip)
+
+            # Cleanup WAF IP Set as well
+            if self._waf_enabled:
+                self._cleanup_expired_waf_entries(expired_ips)
+
+            # Emit metric for expired blocks
+            self._metrics.put_count("BlocksExpired", len(expired_ips), metrics_dimensions)
         else:
             logging.info("No expired blocks found.")
+            self._metrics.put_count("BlocksExpired", 0, metrics_dimensions)
 
         # Periodic cleanup of very old entries (prevents unbounded growth)
         self._cleanup_old_registry_entries(now, days_old=30)
 
         logging.info("Step 5/7: Scanning S3 for ALB log files...")
         start_scan_time = now - self.lookback_delta
+
+        # Cleanup old processed file records (2x lookback period)
+        lookback_hours = self.lookback_delta.total_seconds() / 3600
+        self._cleanup_old_processed_files(lookback_hours)
+
         all_log_keys = []
+        files_with_etags: Dict[str, str] = {}  # key -> etag mapping for marking processed
+
         for bucket, prefix in unique_log_locations:
-            keys = self._find_log_files_in_window(bucket, prefix, start_scan_time)
-            all_log_keys.extend([(bucket, key) for key in keys])
+            file_tuples = self._find_log_files_in_window(bucket, prefix, start_scan_time)
+            for key, etag in file_tuples:
+                all_log_keys.append((bucket, key))
+                files_with_etags[f"{bucket}:{key}"] = etag
 
         logging.info(f"Step 6/7: Processing {len(all_log_keys)} log file(s)...")
 
+        # Emit metric for files processed
+        self._metrics.put_count("LogFilesProcessed", len(all_log_keys), metrics_dimensions)
+
         # Process logs and get new offenders
         new_offenders = set()
-        ip_counts = Counter()
+        ip_counts: Counter = Counter()
+        ip_versions: Dict[str, int] = {}  # Track IP version for each IP
 
         if all_log_keys:
-            all_malicious_ips = self._process_logs_in_parallel(all_log_keys)
-            if all_malicious_ips:
-                ip_counts = Counter(all_malicious_ips)
-                new_offenders = {
-                    ip
-                    for ip, count in ip_counts.items()
-                    if count >= self.threshold
-                    and ip not in self.whitelist
-                    and not is_aws_ip(ip, self.aws_networks)
-                }
+            all_malicious_ips_with_version = self._process_logs_in_parallel(all_log_keys)
+            if all_malicious_ips_with_version:
+                # Count IPs and track versions
+                for ip, version in all_malicious_ips_with_version:
+                    ip_counts[ip] += 1
+                    ip_versions[ip] = version  # Store the version
+
+                # Identify new offenders (both IPv4 and IPv6)
+                new_offenders = set()
+                for ip, count in ip_counts.items():
+                    if count < self.threshold:
+                        continue
+                    if ip in self.whitelist:
+                        continue
+
+                    # Check AWS IP with appropriate network list
+                    version = ip_versions.get(ip, 4)
+                    if version == 4:
+                        if is_aws_ip(ip, self.aws_ipv4_networks, None):
+                            continue
+                    elif version == 6:
+                        if is_aws_ip(ip, set(), self.aws_ipv6_networks):
+                            continue
+
+                    new_offenders.add(ip)
+
+                # Multi-signal threat filtering (when enabled)
+                if self._enable_multi_signal and new_offenders:
+                    logging.info("Applying multi-signal threat detection...")
+                    multi_signal_offenders = self._filter_by_multi_signal(
+                        new_offenders, all_log_keys, metrics_dimensions
+                    )
+                    filtered_count = len(new_offenders) - len(multi_signal_offenders)
+                    if filtered_count > 0:
+                        logging.info(
+                            f"Multi-signal filtering: {filtered_count} potential false positive(s) removed"
+                        )
+                        self._metrics.put_count("FalsePositivesFiltered", filtered_count, metrics_dimensions)
+                    new_offenders = multi_signal_offenders
+
+                # Emit metric for total malicious hits detected
+                self._metrics.put_count(
+                    "MaliciousHitsDetected",
+                    len(all_malicious_ips_with_version),
+                    metrics_dimensions,
+                )
 
                 if new_offenders:
+                    ipv4_count = sum(1 for ip in new_offenders if ip_versions.get(ip, 4) == 4)
+                    ipv6_count = sum(1 for ip in new_offenders if ip_versions.get(ip, 4) == 6)
                     logging.warning(
-                        f"Identified {len(new_offenders)} new offender(s) from recent logs."
+                        f"Identified {len(new_offenders)} new offender(s) from recent logs "
+                        f"(IPv4: {ipv4_count}, IPv6: {ipv6_count})"
                     )
-                    # Update registry with new offenders
+
+                    # Emit metrics for new offenders
+                    self._metrics.put_count("NewOffendersIPv4", ipv4_count, metrics_dimensions)
+                    self._metrics.put_count("NewOffendersIPv6", ipv6_count, metrics_dimensions)
+                    self._metrics.put_count("NewOffendersTotal", len(new_offenders), metrics_dimensions)
+
+                    # Update registry with new offenders (including IP version)
                     for ip in new_offenders:
-                        self._update_registry_entry(ip, ip_counts[ip], now)
+                        version = ip_versions.get(ip, 4)
+                        self._update_registry_entry(ip, ip_counts[ip], now, version)
+                else:
+                    self._metrics.put_count("NewOffendersTotal", 0, metrics_dimensions)
+
+                # Mark processed files (even if no malicious activity found)
+                for cache_key, etag in files_with_etags.items():
+                    parts = cache_key.split(":", 1)
+                    if len(parts) == 2:
+                        self._mark_file_processed(parts[0], parts[1], etag)
             else:
                 logging.info("No malicious activity found in recent log files.")
+                # Still mark files as processed
+                for cache_key, etag in files_with_etags.items():
+                    parts = cache_key.split(":", 1)
+                    if len(parts) == 2:
+                        self._mark_file_processed(parts[0], parts[1], etag)
         else:
             logging.info("No relevant log files found in lookback window.")
 
@@ -645,8 +1816,14 @@ class NaclAutoBlocker:
         logging.info("Step 7/7: Updating NACL rules with time-based blocks...")
         self._update_nacl_rules_with_registry(nacl_id, ips_to_block, active_blocks)
 
-        # Save registry
+        # Sync blocked IPs to WAF IP Set (if enabled)
+        if self._waf_enabled:
+            logging.info("Syncing blocked IPs to WAF IP Set...")
+            self._sync_waf_ip_set(ips_to_block)
+
+        # Save registry and processed files cache
         self._save_block_registry()
+        self._save_processed_files_cache()
 
         final_deny_rules, _ = self._get_nacl_rules(nacl_id)
         final_blocked_ips = {cidr.split("/")[0] for cidr in final_deny_rules.values()}
@@ -655,15 +1832,46 @@ class NaclAutoBlocker:
         )
 
         # Send summary notification to Slack (only if there were changes)
-        self._send_summary_notification_with_registry(
-            new_offenders,
-            final_blocked_ips,
-            ip_counts,
-            initially_blocked_ips,
-            active_blocks,
-        )
+        if self._enhanced_slack:
+            self._send_enhanced_slack_notification(
+                new_offenders,
+                final_blocked_ips,
+                ip_counts,
+                initially_blocked_ips,
+                active_blocks,
+            )
+        else:
+            self._send_summary_notification_with_registry(
+                new_offenders,
+                final_blocked_ips,
+                ip_counts,
+                initially_blocked_ips,
+                active_blocks,
+            )
 
-        logging.info("--- Script Finished ---")
+        # Retry any failed Slack notifications
+        self._retry_failed_slack_messages()
+
+        # Emit metrics for active blocks
+        self._metrics.put_count("ActiveBlocksTotal", len(ips_to_block), metrics_dimensions)
+        self._metrics.put_count("NACLBlockedIPs", len(final_blocked_ips), metrics_dimensions)
+
+        # Log execution summary with error counts
+        if self._s3_processing_errors > 0:
+            logging.warning(f"S3 processing errors during this run: {self._s3_processing_errors} file(s) skipped")
+            self._metrics.put_count("S3ProcessingErrors", self._s3_processing_errors, metrics_dimensions)
+        if self._ipinfo_circuit_open:
+            logging.warning("IPInfo was disabled during this run due to repeated failures")
+            self._metrics.put_count("IPInfoCircuitBreakerTripped", 1, metrics_dimensions)
+
+        # Emit run timing metric
+        run_duration = time.time() - run_start_time
+        self._metrics.put_timing("RunDuration", run_duration, metrics_dimensions)
+
+        # Flush all buffered metrics
+        self._metrics.flush()
+
+        logging.info(f"--- Script Finished (duration: {run_duration:.2f}s) ---")
 
     def _discover_target_lbs(self) -> Optional[Dict[str, Dict]]:
         """Finds all LBs matching the pattern and their details."""
@@ -764,7 +1972,18 @@ class NaclAutoBlocker:
 
     def _find_log_files_in_window(
         self, bucket: str, prefix: str, start_time: datetime
-    ) -> List[str]:
+    ) -> List[Tuple[str, str]]:
+        """
+        Find log files within the lookback window.
+
+        Args:
+            bucket: S3 bucket name
+            prefix: S3 prefix for logs
+            start_time: Start of lookback window
+
+        Returns:
+            List of tuples (key, etag) for each log file found.
+        """
         try:
             paginator = self.s3.get_paginator("list_objects_v2")
             account_id = self.sts.get_caller_identity().get("Account")
@@ -788,7 +2007,9 @@ class NaclAutoBlocker:
                 f"across {len(date_prefixes)} date(s) from {start_time.date()} to {end_date}"
             )
 
-            log_files_to_process = []
+            all_files = []
+            new_files = []
+            skipped_files = 0
 
             # Scan each date prefix separately (much faster than scanning all dates)
             for date_prefix in date_prefixes:
@@ -805,21 +2026,48 @@ class NaclAutoBlocker:
                                 not obj["Key"].endswith("/")
                                 and obj["LastModified"] >= start_time
                             ):
-                                log_files_to_process.append(obj["Key"])
+                                key = obj["Key"]
+                                etag = obj.get("ETag", "").strip('"')
 
-            logging.info(
-                f"S3 scan complete: found {len(log_files_to_process)} matching log file(s) across {len(date_prefixes)} date(s)."
-            )
-            return log_files_to_process
+                                all_files.append((key, etag))
+
+                                # Check if already processed (incremental processing)
+                                if self._is_file_already_processed(bucket, key, etag):
+                                    skipped_files += 1
+                                else:
+                                    new_files.append((key, etag))
+
+            # Update counters for metrics
+            self._new_files_count = len(new_files)
+            self._skipped_files_count = skipped_files
+
+            if skipped_files > 0:
+                logging.info(
+                    f"S3 scan complete: found {len(all_files)} file(s), "
+                    f"skipping {skipped_files} already-processed, "
+                    f"processing {len(new_files)} new file(s)"
+                )
+            else:
+                logging.info(
+                    f"S3 scan complete: found {len(new_files)} file(s) to process "
+                    f"across {len(date_prefixes)} date(s)."
+                )
+
+            return new_files
         except Exception as e:
             logging.error(f"Error listing S3 objects for prefix {prefix}: {e}")
             return []
 
     def _process_logs_in_parallel(
         self, bucket_key_pairs: List[Tuple[str, str]]
-    ) -> List[str]:
-        """Uses a thread pool to download and parse logs concurrently."""
-        all_malicious_ips = []
+    ) -> List[Tuple[str, int]]:
+        """
+        Uses a thread pool to download and parse logs concurrently.
+
+        Returns:
+            List of tuples (ip_address, ip_version) for all malicious IPs found.
+        """
+        all_malicious_ips: List[Tuple[str, int]] = []
         total_files = len(bucket_key_pairs)
         completed_files = 0
 
@@ -847,22 +2095,340 @@ class NaclAutoBlocker:
                     logging.error(f"Error processing a log file in thread: {e}")
         return all_malicious_ips
 
-    def _download_and_parse_log(self, bucket: str, key: str) -> List[str]:
-        logging.debug(f"Starting processing for file: {key.split('/')[-1]}")
-        response = self.s3.get_object(Bucket=bucket, Key=key)
-        with gzip.open(response["Body"], "rt") as f:
-            malicious_ips = []
-            for line in f:
-                if ATTACK_PATTERNS.search(line):
+    def _download_and_parse_log(self, bucket: str, key: str) -> List[Tuple[str, int]]:
+        """
+        Download and parse a single ALB log file from S3.
+
+        Args:
+            bucket: S3 bucket name
+            key: S3 object key
+
+        Returns:
+            List of tuples (ip_address, ip_version) for malicious IPs found.
+            Returns empty list on error (logged but not raised).
+        """
+        filename = key.split("/")[-1]
+        logging.debug(f"Starting processing for file: {filename}")
+
+        try:
+            response = self.s3.get_object(Bucket=bucket, Key=key)
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in ("NoSuchKey", "AccessDenied"):
+                logging.warning(f"S3 access error for {filename}: {error_code} - skipping file")
+            else:
+                logging.error(f"S3 error fetching {filename}: {e} - skipping file")
+            self._s3_processing_errors += 1
+            return []
+        except Exception as e:
+            logging.error(f"Unexpected error fetching {filename} from S3: {e} - skipping file")
+            self._s3_processing_errors += 1
+            return []
+
+        try:
+            with gzip.open(response["Body"], "rt") as f:
+                malicious_ips = []
+                for line in f:
+                    if ATTACK_PATTERNS.search(line):
+                        parts = line.split()
+                        if len(parts) > 3:
+                            # Client IP:port is in field 4 (index 3)
+                            client_field = parts[3]
+
+                            # Handle IPv6 addresses which may be in brackets [::1]:port
+                            if client_field.startswith('['):
+                                # IPv6 format: [::1]:port
+                                bracket_end = client_field.find(']')
+                                if bracket_end > 0:
+                                    ip_str = client_field[1:bracket_end]
+                                else:
+                                    continue
+                            else:
+                                # IPv4 format: 1.2.3.4:port
+                                ip_str = client_field.split(":")[0]
+
+                            # Check if it's a valid public IP (v4 or v6)
+                            is_valid, ip_version = is_valid_public_ip(ip_str)
+                            if is_valid:
+                                # If IPv6 disabled, skip IPv6 addresses
+                                if ip_version == 6 and not self.enable_ipv6:
+                                    continue
+                                malicious_ips.append((ip_str, ip_version))
+                            elif is_valid_public_ipv4(ip_str):
+                                # Fallback for backward compatibility
+                                malicious_ips.append((ip_str, 4))
+
+            logging.debug(
+                f"Finished processing file: {filename}, found {len(malicious_ips)} malicious IPs."
+            )
+            return malicious_ips
+        except gzip.BadGzipFile as e:
+            logging.warning(f"Corrupted gzip file {filename}: {e} - skipping file")
+            self._s3_processing_errors += 1
+            return []
+        except Exception as e:
+            logging.error(f"Error parsing log file {filename}: {e} - skipping file")
+            self._s3_processing_errors += 1
+            return []
+
+    def _download_and_parse_log_multi_signal(
+        self, bucket: str, key: str
+    ) -> Dict[str, ThreatSignals]:
+        """
+        Download and parse a log file with multi-signal threat detection.
+
+        Extracts additional signals beyond attack patterns:
+        - HTTP status codes (4xx/5xx)
+        - User-agent analysis
+        - Request paths for diversity scoring
+
+        Args:
+            bucket: S3 bucket name
+            key: S3 object key
+
+        Returns:
+            Dict mapping IP addresses to their ThreatSignals objects.
+        """
+        filename = key.split("/")[-1]
+        logging.debug(f"Multi-signal processing for file: {filename}")
+
+        ip_signals: Dict[str, ThreatSignals] = {}
+
+        try:
+            response = self.s3.get_object(Bucket=bucket, Key=key)
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in ("NoSuchKey", "AccessDenied"):
+                logging.warning(f"S3 access error for {filename}: {error_code} - skipping file")
+            else:
+                logging.error(f"S3 error fetching {filename}: {e} - skipping file")
+            self._s3_processing_errors += 1
+            return {}
+        except Exception as e:
+            logging.error(f"Unexpected error fetching {filename} from S3: {e} - skipping file")
+            self._s3_processing_errors += 1
+            return {}
+
+        try:
+            with gzip.open(response["Body"], "rt") as f:
+                for line in f:
+                    # Parse ALB log line
+                    # ALB log format fields:
+                    # 0: type, 1: timestamp, 2: elb, 3: client:port, 4: target:port,
+                    # 5: request_processing_time, 6: target_processing_time,
+                    # 7: response_processing_time, 8: elb_status_code,
+                    # 9: target_status_code, 10: received_bytes, 11: sent_bytes,
+                    # 12: "request", 13: "user_agent", ...
+
                     parts = line.split()
-                    if len(parts) > 3:
-                        ip_str = parts[3].split(":")[0]
-                        if is_valid_public_ipv4(ip_str):
-                            malicious_ips.append(ip_str)
-        logging.debug(
-            f"Finished processing file: {key.split('/')[-1]}, found {len(malicious_ips)} malicious IPs."
-        )
-        return malicious_ips
+                    if len(parts) < 14:
+                        continue
+
+                    # Extract client IP
+                    client_field = parts[3]
+                    if client_field.startswith('['):
+                        bracket_end = client_field.find(']')
+                        if bracket_end > 0:
+                            ip_str = client_field[1:bracket_end]
+                        else:
+                            continue
+                    else:
+                        ip_str = client_field.split(":")[0]
+
+                    # Check if valid public IP
+                    is_valid, ip_version = is_valid_public_ip(ip_str)
+                    if not is_valid:
+                        continue
+
+                    # Skip IPv6 if disabled
+                    if ip_version == 6 and not self.enable_ipv6:
+                        continue
+
+                    # Parse status code (ELB status code at index 8)
+                    try:
+                        status_code = int(parts[8])
+                    except (ValueError, IndexError):
+                        status_code = 0
+
+                    # Parse request (at index 12, quoted)
+                    # Format: "GET /path HTTP/1.1"
+                    request_field = ""
+                    try:
+                        # Find quoted request field
+                        quote_start = line.find('"')
+                        if quote_start >= 0:
+                            quote_end = line.find('"', quote_start + 1)
+                            if quote_end > quote_start:
+                                request_field = line[quote_start + 1 : quote_end]
+                    except Exception:
+                        pass
+
+                    # Extract path from request
+                    path = "/"
+                    if request_field:
+                        request_parts = request_field.split()
+                        if len(request_parts) >= 2:
+                            path = request_parts[1].split("?")[0]  # Remove query string
+
+                    # Parse user agent (second quoted field after request)
+                    user_agent = ""
+                    try:
+                        first_quote_end = line.find('"', line.find('"') + 1)
+                        if first_quote_end >= 0:
+                            ua_start = line.find('"', first_quote_end + 1)
+                            if ua_start >= 0:
+                                ua_end = line.find('"', ua_start + 1)
+                                if ua_end > ua_start:
+                                    user_agent = line[ua_start + 1 : ua_end]
+                    except Exception:
+                        pass
+
+                    # Check for attack patterns
+                    has_attack_pattern = bool(ATTACK_PATTERNS.search(line))
+
+                    # Check for scanner user agent
+                    has_scanner_ua = bool(SCANNER_USER_AGENTS.search(user_agent)) if user_agent else False
+
+                    # Create or update threat signals for this IP
+                    if ip_str not in ip_signals:
+                        ip_signals[ip_str] = ThreatSignals()
+
+                    ip_signals[ip_str].add_request(
+                        has_attack_pattern=has_attack_pattern,
+                        has_scanner_ua=has_scanner_ua,
+                        status_code=status_code,
+                        path=path,
+                    )
+
+            logging.debug(f"Multi-signal processed {filename}: {len(ip_signals)} unique IPs")
+            return ip_signals
+
+        except gzip.BadGzipFile as e:
+            logging.warning(f"Corrupted gzip file {filename}: {e} - skipping file")
+            self._s3_processing_errors += 1
+            return {}
+        except Exception as e:
+            logging.error(f"Error parsing log file {filename}: {e} - skipping file")
+            self._s3_processing_errors += 1
+            return {}
+
+    def _aggregate_threat_signals(
+        self, signal_dicts: List[Dict[str, ThreatSignals]]
+    ) -> Dict[str, ThreatSignals]:
+        """
+        Aggregate threat signals from multiple log files.
+
+        Args:
+            signal_dicts: List of dicts mapping IPs to ThreatSignals
+
+        Returns:
+            Combined dict with aggregated signals
+        """
+        aggregated: Dict[str, ThreatSignals] = {}
+
+        for signals in signal_dicts:
+            for ip, signals_obj in signals.items():
+                if ip not in aggregated:
+                    aggregated[ip] = ThreatSignals()
+
+                # Merge signals
+                agg = aggregated[ip]
+                agg.attack_pattern_hits += signals_obj.attack_pattern_hits
+                agg.scanner_ua_hits += signals_obj.scanner_ua_hits
+                agg.error_responses += signals_obj.error_responses
+                agg.total_requests += signals_obj.total_requests
+                agg.unique_paths.update(signals_obj.unique_paths)
+
+                if signals_obj.first_seen:
+                    if agg.first_seen is None or signals_obj.first_seen < agg.first_seen:
+                        agg.first_seen = signals_obj.first_seen
+                if signals_obj.last_seen:
+                    if agg.last_seen is None or signals_obj.last_seen > agg.last_seen:
+                        agg.last_seen = signals_obj.last_seen
+
+        return aggregated
+
+    def _filter_by_multi_signal(
+        self,
+        candidate_ips: Set[str],
+        log_keys: List[Tuple[str, str]],
+        metrics_dimensions: Dict[str, str],
+    ) -> Set[str]:
+        """
+        Filter candidate IPs using multi-signal threat detection.
+
+        Only IPs that meet the threat score threshold are returned.
+
+        Args:
+            candidate_ips: Set of IPs that passed initial pattern matching
+            log_keys: List of (bucket, key) tuples for log files to analyze
+            metrics_dimensions: Dimensions for CloudWatch metrics
+
+        Returns:
+            Set of IPs that pass the multi-signal threshold
+        """
+        if not candidate_ips:
+            return set()
+
+        # Process logs with multi-signal extraction
+        all_signals: List[Dict[str, ThreatSignals]] = []
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {
+                executor.submit(self._download_and_parse_log_multi_signal, bucket, key): (bucket, key)
+                for bucket, key in log_keys
+            }
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        all_signals.append(result)
+                except Exception as e:
+                    bucket, key = futures[future]
+                    logging.warning(f"Error in multi-signal processing for {key}: {e}")
+
+        # Aggregate signals across all files
+        aggregated = self._aggregate_threat_signals(all_signals)
+
+        # Filter candidates based on threat scores
+        confirmed_offenders = set()
+
+        for ip in candidate_ips:
+            if ip not in aggregated:
+                # No multi-signal data - use original pattern-match decision
+                # This shouldn't happen normally, but be safe
+                confirmed_offenders.add(ip)
+                continue
+
+            signals = aggregated[ip]
+            is_malicious, score, breakdown = signals.is_malicious(self._threat_signals_config)
+
+            if is_malicious:
+                confirmed_offenders.add(ip)
+                logging.debug(
+                    f"IP {ip}: threat score {score:.1f} - CONFIRMED "
+                    f"(patterns: {breakdown.get('attack_pattern', 0):.1f}, "
+                    f"scanner_ua: {breakdown.get('scanner_ua', 0):.1f}, "
+                    f"errors: {breakdown.get('error_rate', 0):.1f})"
+                )
+            else:
+                logging.info(
+                    f"IP {ip}: threat score {score:.1f} < {self._threat_signals_config['min_threat_score']} "
+                    f"- likely false positive, skipping block"
+                )
+
+        # Emit metrics for threat scores
+        if aggregated:
+            avg_score = sum(
+                signals.calculate_threat_score(self._threat_signals_config)[0]
+                for ip, signals in aggregated.items()
+                if ip in candidate_ips
+            ) / len(candidate_ips) if candidate_ips else 0
+            self._metrics.put_metric(
+                "AverageThreatScore", avg_score, "None", metrics_dimensions
+            )
+
+        return confirmed_offenders
 
     def _get_nacl_rules(self, nacl_id: str) -> Tuple[Dict[int, str], Set[int]]:
         """Gets all rules for a given NACL and separates them."""
@@ -1100,6 +2666,10 @@ class NaclAutoBlocker:
         Args:
             message: The message to send
             is_critical: If True, adds warning emoji to the message
+
+        Note:
+            Failed notifications are queued for retry at end of run.
+            Notification failures never affect core blocking logic.
         """
         if not self.slack_client:
             return
@@ -1111,11 +2681,46 @@ class NaclAutoBlocker:
         try:
             success = self.slack_client.post_message(message=message)
             if success:
-                logging.debug(f"Slack notification sent: {message}")
+                logging.debug(f"Slack notification sent successfully")
             else:
-                logging.debug("Failed to send Slack notification")
+                # Queue for retry
+                self._failed_slack_messages.append((message, is_critical))
+                logging.debug("Slack notification failed - queued for retry")
         except Exception as e:
-            logging.warning(f"Error sending Slack notification: {e}")
+            # Queue for retry - don't let Slack failures affect blocking
+            self._failed_slack_messages.append((message, is_critical))
+            logging.warning(f"Error sending Slack notification (queued for retry): {e}")
+
+    def _retry_failed_slack_messages(self):
+        """
+        Retry sending failed Slack messages at end of run.
+        Called once after all blocking operations complete.
+        """
+        if not self._failed_slack_messages or not self.slack_client:
+            return
+
+        logging.info(f"Retrying {len(self._failed_slack_messages)} failed Slack notification(s)...")
+        retry_successes = 0
+
+        for message, is_critical in self._failed_slack_messages:
+            try:
+                # Remove emoji prefix if already added (to avoid duplication)
+                clean_message = message.replace(":warning: ", "") if is_critical else message
+                final_message = f":warning: {clean_message}" if is_critical else clean_message
+
+                success = self.slack_client.post_message(message=final_message)
+                if success:
+                    retry_successes += 1
+            except Exception as e:
+                logging.debug(f"Retry failed for Slack message: {e}")
+
+        if retry_successes > 0:
+            logging.info(f"Successfully sent {retry_successes}/{len(self._failed_slack_messages)} queued Slack notifications")
+        else:
+            logging.warning(f"All {len(self._failed_slack_messages)} Slack notification retries failed")
+
+        # Clear the queue
+        self._failed_slack_messages.clear()
 
     def _send_summary_notification(
         self,
@@ -1268,13 +2873,185 @@ class NaclAutoBlocker:
         message = "\n".join(summary_lines)
         self._send_slack_notification(message, is_critical=bool(newly_blocked))
 
+    def _send_enhanced_slack_notification(
+        self,
+        new_offenders: Set[str],
+        final_blocked_ips: Set[str],
+        ip_counts: Counter,
+        initially_blocked_ips: Set[str],
+        active_blocks: Dict[str, Dict],
+        run_id: Optional[str] = None,
+    ):
+        """
+        Sends enhanced Slack notifications with:
+        - Severity-based color coding
+        - Incident threading (all messages grouped by run_id)
+        - Actionable information organized by threat tier
+
+        Args:
+            new_offenders: Set of newly detected offending IPs
+            final_blocked_ips: Set of IPs actually blocked in NACL
+            ip_counts: Counter of malicious hits per IP
+            initially_blocked_ips: Set of IPs that were blocked before this run
+            active_blocks: Current block registry with tier information
+            run_id: Optional run identifier for threading
+        """
+        if not self.slack_client or self.dry_run:
+            return
+
+        # Calculate actual changes
+        newly_blocked = final_blocked_ips - initially_blocked_ips
+        newly_unblocked = initially_blocked_ips - final_blocked_ips
+
+        # Skip if no changes
+        if not newly_blocked and not newly_unblocked:
+            logging.info("No changes to blocked IPs. Skipping enhanced Slack notification.")
+            return
+
+        # Generate run_id for threading if not provided
+        if not run_id:
+            run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+        incident_id = f"block_run_{run_id}"
+
+        # Determine overall severity based on highest threat tier
+        max_severity = SlackSeverity.INFO
+        tier_breakdown = {"minimal": 0, "low": 0, "medium": 0, "high": 0, "critical": 0}
+
+        for ip in newly_blocked:
+            tier = active_blocks.get(ip, {}).get("tier", "low")
+            tier_breakdown[tier] = tier_breakdown.get(tier, 0) + 1
+            tier_severity = TIER_TO_SEVERITY.get(tier, SlackSeverity.LOW)
+            if tier_severity.value > max_severity.value:
+                max_severity = tier_severity
+
+        # Use critical severity if many IPs blocked
+        if len(newly_blocked) >= 10:
+            max_severity = SlackSeverity.CRITICAL
+        elif len(newly_blocked) >= 5 and max_severity.value < SlackSeverity.HIGH.value:
+            max_severity = SlackSeverity.HIGH
+
+        # Build summary fields
+        fields = [
+            ("Region", self.region),
+            ("Pattern", f"`{self.lb_name_pattern}`"),
+            ("Total Blocked", str(len(final_blocked_ips))),
+            ("Lookback", str(self.lookback_delta)),
+        ]
+
+        if newly_blocked:
+            fields.append(("Newly Blocked", str(len(newly_blocked))))
+        if newly_unblocked:
+            fields.append(("Unblocked", str(len(newly_unblocked))))
+
+        # Tier breakdown
+        active_tiers = [f"{t}: {c}" for t, c in tier_breakdown.items() if c > 0]
+        if active_tiers:
+            fields.append(("Tier Breakdown", ", ".join(active_tiers)))
+
+        # Build description with top offenders
+        description_parts = []
+        if newly_blocked:
+            # Group by tier and show top offenders
+            tier_groups = {"critical": [], "high": [], "medium": [], "low": [], "minimal": []}
+            for ip in newly_blocked:
+                tier = active_blocks.get(ip, {}).get("tier", "low")
+                hits = ip_counts.get(ip, active_blocks.get(ip, {}).get("total_hits", 0))
+                tier_groups[tier].append((ip, hits))
+
+            # Show critical/high first
+            for tier_name in ["critical", "high", "medium", "low", "minimal"]:
+                ips_in_tier = tier_groups[tier_name]
+                if ips_in_tier:
+                    ips_in_tier.sort(key=lambda x: x[1], reverse=True)
+                    emoji = self._get_tier_emoji(tier_name)
+                    description_parts.append(f"\n{emoji} *{tier_name.upper()} tier ({len(ips_in_tier)}):*")
+                    for ip, hits in ips_in_tier[:3]:  # Top 3 per tier
+                        duration = active_blocks.get(ip, {}).get("block_duration_hours", 0)
+                        duration_str = self._format_duration(duration)
+                        ip_info = self._get_ip_info(ip)
+                        location = ""
+                        if ip_info:
+                            location = f" ({ip_info.get('country_code', '')})"
+                        description_parts.append(f"  `{ip}`{location} - {hits} hits, blocked {duration_str}")
+                    if len(ips_in_tier) > 3:
+                        description_parts.append(f"  _...and {len(ips_in_tier) - 3} more_")
+
+        if newly_unblocked:
+            description_parts.append(f"\n:white_check_mark: *Unblocked ({len(newly_unblocked)}):*")
+            for ip in list(newly_unblocked)[:3]:
+                description_parts.append(f"  `{ip}`")
+            if len(newly_unblocked) > 3:
+                description_parts.append(f"  _...and {len(newly_unblocked) - 3} more_")
+
+        description = "\n".join(description_parts) if description_parts else "No details available"
+
+        # Build action buttons (informational - actual action requires external handling)
+        action_buttons = []
+        if newly_blocked:
+            # Add informational button
+            action_buttons.append({
+                "text": "View Details",
+                "action_id": f"view_details_{run_id}",
+                "value": json.dumps({
+                    "run_id": run_id,
+                    "newly_blocked": list(newly_blocked)[:10],
+                    "region": self.region,
+                }),
+            })
+
+        # Post the enhanced notification
+        try:
+            self.slack_client.post_incident_notification(
+                title=f":shield: Auto Block Attackers - {self.region}",
+                description=description,
+                fields=fields,
+                severity=max_severity,
+                incident_id=incident_id,
+                action_buttons=action_buttons if action_buttons else None,
+            )
+            logging.info(f"Enhanced Slack notification sent for run {run_id}")
+        except Exception as e:
+            logging.warning(f"Failed to send enhanced Slack notification: {e}")
+            # Fall back to basic notification
+            self._send_slack_notification(
+                f"Auto Block Attackers - {self.region}: {len(newly_blocked)} blocked, {len(newly_unblocked)} unblocked",
+                is_critical=bool(newly_blocked),
+            )
+
+    def _get_tier_emoji(self, tier: str) -> str:
+        """Get emoji for threat tier."""
+        emoji_map = {
+            "critical": ":rotating_light:",
+            "high": ":red_circle:",
+            "medium": ":large_orange_circle:",
+            "low": ":large_yellow_circle:",
+            "minimal": ":white_circle:",
+        }
+        return emoji_map.get(tier, ":question:")
+
+    def _format_duration(self, hours: float) -> str:
+        """Format duration in hours to human readable string."""
+        if hours >= 24:
+            days = int(hours / 24)
+            return f"{days}d"
+        elif hours >= 1:
+            return f"{int(hours)}h"
+        else:
+            return f"{int(hours * 60)}m"
+
     def _get_ip_info(self, ip: str) -> Optional[Dict]:
         """
         Fetches detailed geolocation and hosting information for an IP address.
         Returns None if ipinfo is not configured or if lookup fails.
         Uses in-memory caching to reduce API calls.
+        Implements circuit breaker to disable after repeated failures.
         """
         if not self.ipinfo_handler:
+            return None
+
+        # Circuit breaker: skip if too many failures
+        if self._ipinfo_circuit_open:
             return None
 
         # Check cache first
@@ -1312,9 +3089,21 @@ class NaclAutoBlocker:
             # Store in cache
             self.ipinfo_cache[ip] = (now, info)
 
+            # Reset failure counter on success
+            self._ipinfo_failures = 0
+
             return info
         except Exception as e:
-            logging.warning(f"Failed to fetch IP info for {ip}: {e}")
+            self._ipinfo_failures += 1
+            logging.warning(f"Failed to fetch IP info for {ip}: {e} (failure {self._ipinfo_failures}/{self._ipinfo_failure_threshold})")
+
+            # Open circuit breaker after threshold failures
+            if self._ipinfo_failures >= self._ipinfo_failure_threshold:
+                self._ipinfo_circuit_open = True
+                logging.warning(
+                    f"IPInfo circuit breaker OPEN - disabled for rest of run after {self._ipinfo_failures} consecutive failures"
+                )
+
             return None
 
     def _format_ip_info(self, ip_info: Optional[Dict]) -> str:
@@ -1364,6 +3153,13 @@ class NaclAutoBlocker:
                 self._send_slack_notification(
                     f"[{self.region}] Removed IP block: {ip} (rule {rule_num}) - no longer meets threshold"
                 )
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code == "InvalidNetworkAclEntry.NotFound":
+                    # Rule already deleted (possibly manually) - treat as success
+                    logging.warning(f"Rule {rule_num} for {ip} was already deleted (not found)")
+                else:
+                    logging.error(f"Failed to delete rule {rule_num}: {e}")
             except Exception as e:
                 logging.error(f"Failed to delete rule {rule_num}: {e}")
         else:
@@ -1386,6 +3182,13 @@ class NaclAutoBlocker:
                 self._send_slack_notification(
                     f"[{self.region}] Removed IP block: {ip} (rule {rule_num}) - {reason}"
                 )
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code == "InvalidNetworkAclEntry.NotFound":
+                    # Rule already deleted (possibly manually) - treat as success
+                    logging.warning(f"Rule {rule_num} for {ip} was already deleted (not found)")
+                else:
+                    logging.error(f"Failed to delete rule {rule_num}: {e}")
             except Exception as e:
                 logging.error(f"Failed to delete rule {rule_num}: {e}")
         else:
@@ -1643,6 +3446,11 @@ Example Live Run (scans a specific pattern, provides a whitelist):
         help="Slack channel to send notifications to (also can use SLACK_CHANNEL env var).",
     )
     parser.add_argument(
+        "--enhanced-slack",
+        action="store_true",
+        help="Enable enhanced Slack notifications with color coding, threading, and formatted fields.",
+    )
+    parser.add_argument(
         "--ipinfo-token",
         default=None,
         help="IPInfo API token for IP geolocation (also can use IPINFO_TOKEN env var).",
@@ -1653,6 +3461,123 @@ Example Live Run (scans a specific pattern, provides a whitelist):
         help="Path to block registry JSON file for persistent time-based blocking (default: ./block_registry.json).",
     )
 
+    # Storage backend options
+    parser.add_argument(
+        "--storage-backend",
+        choices=["local", "dynamodb", "s3"],
+        default=None,
+        help="Storage backend type: 'local' (JSON file), 'dynamodb' (DynamoDB table), 's3' (S3 bucket). "
+        "Default: 'local'. Also can use STORAGE_BACKEND env var.",
+    )
+    parser.add_argument(
+        "--dynamodb-table",
+        default=None,
+        help="DynamoDB table name for block registry (required if storage-backend=dynamodb). "
+        "Also can use DYNAMODB_TABLE env var.",
+    )
+    parser.add_argument(
+        "--s3-state-bucket",
+        default=None,
+        help="S3 bucket name for block registry (required if storage-backend=s3). "
+        "Also can use S3_STATE_BUCKET env var.",
+    )
+    parser.add_argument(
+        "--s3-state-key",
+        default="block_registry.json",
+        help="S3 object key for block registry (default: block_registry.json). "
+        "Also can use S3_STATE_KEY env var.",
+    )
+    parser.add_argument(
+        "--create-dynamodb-table",
+        action="store_true",
+        help="Create the DynamoDB table if it doesn't exist (requires additional IAM permissions).",
+    )
+
+    # IPv6 support options
+    parser.add_argument(
+        "--enable-ipv6",
+        action="store_true",
+        default=True,
+        help="Enable IPv6 blocking (default: enabled). Use --no-ipv6 to disable.",
+    )
+    parser.add_argument(
+        "--no-ipv6",
+        action="store_true",
+        help="Disable IPv6 blocking (only block IPv4 addresses).",
+    )
+    parser.add_argument(
+        "--start-rule-ipv6",
+        type=int,
+        default=180,
+        help="Starting NACL rule number for IPv6 DENY rules (default: 180).",
+    )
+    parser.add_argument(
+        "--limit-ipv6",
+        type=int,
+        default=20,
+        help="Maximum number of IPv6 DENY rules to manage (default: 20).",
+    )
+    parser.add_argument(
+        "--force-reprocess",
+        action="store_true",
+        help="Force reprocessing of all log files, ignoring the processed files cache.",
+    )
+
+    # AWS WAF IP Set arguments
+    parser.add_argument(
+        "--waf-ip-set-name",
+        type=str,
+        help="Name of the AWS WAF IP Set to sync blocked IPs to (enables WAF integration).",
+    )
+    parser.add_argument(
+        "--waf-ip-set-id",
+        type=str,
+        help="ID of an existing AWS WAF IP Set to use (alternative to --waf-ip-set-name).",
+    )
+    parser.add_argument(
+        "--waf-ip-set-scope",
+        type=str,
+        choices=["REGIONAL", "CLOUDFRONT"],
+        default="REGIONAL",
+        help="WAF IP Set scope: REGIONAL (for ALB/API Gateway) or CLOUDFRONT (default: REGIONAL).",
+    )
+    parser.add_argument(
+        "--create-waf-ip-set",
+        action="store_true",
+        help="Create the WAF IP Set if it doesn't exist.",
+    )
+
+    # Structured logging & CloudWatch metrics
+    parser.add_argument(
+        "--json-logging",
+        action="store_true",
+        help="Enable JSON structured logging format (for CloudWatch Logs ingestion).",
+    )
+    parser.add_argument(
+        "--enable-cloudwatch-metrics",
+        action="store_true",
+        help="Enable publishing metrics to CloudWatch (requires IAM permissions).",
+    )
+    parser.add_argument(
+        "--cloudwatch-namespace",
+        type=str,
+        default="AutoBlockAttackers",
+        help="CloudWatch metrics namespace (default: AutoBlockAttackers).",
+    )
+
+    # Multi-signal threat detection
+    parser.add_argument(
+        "--disable-multi-signal",
+        action="store_true",
+        help="Disable multi-signal threat detection (use pattern matching only).",
+    )
+    parser.add_argument(
+        "--min-threat-score",
+        type=int,
+        default=40,
+        help="Minimum threat score (0-100) to block an IP (default: 40).",
+    )
+
     args = parser.parse_args()
 
     # Get Slack credentials from args or environment variables
@@ -1661,6 +3586,35 @@ Example Live Run (scans a specific pattern, provides a whitelist):
 
     # Get IPInfo token from args or environment variable
     ipinfo_token = args.ipinfo_token or os.getenv("IPINFO_TOKEN")
+
+    # Get storage backend configuration from args or environment variables
+    storage_backend = args.storage_backend or os.getenv("STORAGE_BACKEND", "local")
+    dynamodb_table = args.dynamodb_table or os.getenv("DYNAMODB_TABLE")
+    s3_state_bucket = args.s3_state_bucket or os.getenv("S3_STATE_BUCKET")
+    s3_state_key = args.s3_state_key or os.getenv("S3_STATE_KEY", "block_registry.json")
+
+    # Get WAF configuration from args or environment variables
+    waf_ip_set_name = args.waf_ip_set_name or os.getenv("WAF_IP_SET_NAME")
+    waf_ip_set_id = args.waf_ip_set_id or os.getenv("WAF_IP_SET_ID")
+    waf_ip_set_scope = args.waf_ip_set_scope or os.getenv("WAF_IP_SET_SCOPE", "REGIONAL")
+    create_waf_ip_set = args.create_waf_ip_set or os.getenv("CREATE_WAF_IP_SET", "").lower() == "true"
+
+    # Get logging & metrics configuration
+    json_logging = args.json_logging or os.getenv("JSON_LOGGING", "").lower() == "true"
+    enable_cloudwatch_metrics = args.enable_cloudwatch_metrics or os.getenv("ENABLE_CLOUDWATCH_METRICS", "").lower() == "true"
+    cloudwatch_namespace = args.cloudwatch_namespace or os.getenv("CLOUDWATCH_NAMESPACE", "AutoBlockAttackers")
+
+    # Get multi-signal configuration
+    disable_multi_signal = args.disable_multi_signal or os.getenv("DISABLE_MULTI_SIGNAL", "").lower() == "true"
+    enable_multi_signal = not disable_multi_signal
+    min_threat_score_env = os.getenv("MIN_THREAT_SCORE")
+    min_threat_score = args.min_threat_score if not min_threat_score_env else int(min_threat_score_env)
+
+    # Build threat signals config if score is customized
+    threat_signals_config = None
+    if min_threat_score != 40:  # Non-default value
+        threat_signals_config = DEFAULT_THREAT_SIGNALS_CONFIG.copy()
+        threat_signals_config["min_threat_score"] = min_threat_score
 
     # Validate inputs
     if args.threshold < 1:
@@ -1679,6 +3633,15 @@ Example Live Run (scans a specific pattern, provides a whitelist):
             f"Will be capped at rule 99."
         )
 
+    # Validate storage backend configuration
+    if storage_backend == "dynamodb" and not dynamodb_table:
+        parser.error("--dynamodb-table is required when using dynamodb storage backend")
+    if storage_backend == "s3" and not s3_state_bucket:
+        parser.error("--s3-state-bucket is required when using s3 storage backend")
+
+    # Handle IPv6 enable/disable flag
+    enable_ipv6 = not args.no_ipv6
+
     blocker = NaclAutoBlocker(
         lb_name_pattern=args.lb_name_pattern,
         region=args.region,
@@ -1694,5 +3657,30 @@ Example Live Run (scans a specific pattern, provides a whitelist):
         slack_channel=slack_channel,
         ipinfo_token=ipinfo_token,
         registry_file=args.registry_file,
+        storage_backend=storage_backend,
+        dynamodb_table=dynamodb_table,
+        s3_state_bucket=s3_state_bucket,
+        s3_state_key=s3_state_key,
+        create_dynamodb_table=args.create_dynamodb_table,
+        # IPv6 support parameters
+        start_rule_ipv6=args.start_rule_ipv6,
+        limit_ipv6=args.limit_ipv6,
+        enable_ipv6=enable_ipv6,
+        # Incremental processing
+        force_reprocess=args.force_reprocess,
+        # AWS WAF IP Set integration
+        waf_ip_set_name=waf_ip_set_name,
+        waf_ip_set_scope=waf_ip_set_scope,
+        waf_ip_set_id=waf_ip_set_id,
+        create_waf_ip_set=create_waf_ip_set,
+        # Structured logging & CloudWatch metrics
+        json_logging=json_logging,
+        enable_cloudwatch_metrics=enable_cloudwatch_metrics,
+        cloudwatch_namespace=cloudwatch_namespace,
+        # Multi-signal threat detection
+        enable_multi_signal=enable_multi_signal,
+        threat_signals_config=threat_signals_config,
+        # Enhanced Slack notifications
+        enhanced_slack=args.enhanced_slack,
     )
     blocker.run()

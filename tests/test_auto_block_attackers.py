@@ -10,10 +10,11 @@ from datetime import timedelta, datetime, timezone
 from collections import Counter
 import sys
 import os
+import logging
 
 # Add parent directory to path to import the module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from auto_block_attackers import NaclAutoBlocker, is_valid_public_ipv4, ATTACK_PATTERNS
+from auto_block_attackers import NaclAutoBlocker, is_valid_public_ipv4, is_valid_public_ip, ATTACK_PATTERNS
 
 
 class TestHelperFunctions(unittest.TestCase):
@@ -37,6 +38,60 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertFalse(is_valid_public_ipv4("not_an_ip"))
         self.assertFalse(is_valid_public_ipv4("256.1.1.1"))
         self.assertFalse(is_valid_public_ipv4("2001:db8::1"))  # IPv6
+
+    def test_is_valid_public_ip_ipv4(self):
+        """Test is_valid_public_ip with valid IPv4 addresses"""
+        is_valid, version = is_valid_public_ip("8.8.8.8")
+        self.assertTrue(is_valid)
+        self.assertEqual(version, 4)
+
+        is_valid, version = is_valid_public_ip("1.1.1.1")
+        self.assertTrue(is_valid)
+        self.assertEqual(version, 4)
+
+    def test_is_valid_public_ip_ipv6(self):
+        """Test is_valid_public_ip with valid IPv6 addresses"""
+        # Google's public IPv6 DNS
+        is_valid, version = is_valid_public_ip("2001:4860:4860::8888")
+        self.assertTrue(is_valid)
+        self.assertEqual(version, 6)
+
+    def test_is_valid_public_ip_private_ipv4(self):
+        """Test is_valid_public_ip rejects private IPv4"""
+        is_valid, version = is_valid_public_ip("192.168.1.1")
+        self.assertFalse(is_valid)
+        self.assertEqual(version, 4)
+
+        is_valid, version = is_valid_public_ip("10.0.0.1")
+        self.assertFalse(is_valid)
+        self.assertEqual(version, 4)
+
+    def test_is_valid_public_ip_private_ipv6(self):
+        """Test is_valid_public_ip rejects private/local IPv6"""
+        # Link-local address
+        is_valid, version = is_valid_public_ip("fe80::1")
+        self.assertFalse(is_valid)
+        self.assertEqual(version, 6)
+
+        # Loopback
+        is_valid, version = is_valid_public_ip("::1")
+        self.assertFalse(is_valid)
+        self.assertEqual(version, 6)
+
+        # Unique local (fc00::/7)
+        is_valid, version = is_valid_public_ip("fd00::1")
+        self.assertFalse(is_valid)
+        self.assertEqual(version, 6)
+
+    def test_is_valid_public_ip_invalid(self):
+        """Test is_valid_public_ip with invalid addresses"""
+        is_valid, version = is_valid_public_ip("not_an_ip")
+        self.assertFalse(is_valid)
+        self.assertEqual(version, 0)
+
+        is_valid, version = is_valid_public_ip("256.1.1.1")
+        self.assertFalse(is_valid)
+        self.assertEqual(version, 0)
 
     def test_attack_patterns_detection(self):
         """Test that attack patterns detect malicious requests"""
@@ -424,8 +479,726 @@ class TestLogParsing(unittest.TestCase):
 
         result = blocker._download_and_parse_log("test-bucket", "test-key")
 
-        # Should extract the IP address
-        self.assertEqual(result, ["1.2.3.4"])
+        # Should extract the IP address with version (now returns tuples)
+        self.assertEqual(result, [("1.2.3.4", 4)])
+
+
+class TestWAFIntegration(unittest.TestCase):
+    """Test AWS WAF IP Set integration"""
+
+    @patch("boto3.client")
+    def test_waf_disabled_by_default(self, mock_boto_client):
+        """Test that WAF is disabled when no IP set name/ID is provided"""
+        mock_ec2 = MagicMock()
+        mock_elbv2 = MagicMock()
+        mock_s3 = MagicMock()
+        mock_sts = MagicMock()
+
+        def client_factory(service, **kwargs):
+            clients = {
+                "ec2": mock_ec2,
+                "elbv2": mock_elbv2,
+                "s3": mock_s3,
+                "sts": mock_sts,
+            }
+            return clients.get(service, MagicMock())
+
+        mock_boto_client.side_effect = client_factory
+
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False
+        )
+
+        self.assertFalse(blocker._waf_enabled)
+        self.assertIsNone(blocker.wafv2)
+
+    @patch("boto3.client")
+    def test_waf_enabled_with_ip_set_name(self, mock_boto_client):
+        """Test that WAF is enabled when IP set name is provided"""
+        mock_ec2 = MagicMock()
+        mock_elbv2 = MagicMock()
+        mock_s3 = MagicMock()
+        mock_sts = MagicMock()
+        mock_wafv2 = MagicMock()
+
+        # Mock WAF IP set search (not found, and not creating)
+        mock_wafv2.get_paginator.return_value.paginate.return_value = [{"IPSets": []}]
+
+        def client_factory(service, **kwargs):
+            clients = {
+                "ec2": mock_ec2,
+                "elbv2": mock_elbv2,
+                "s3": mock_s3,
+                "sts": mock_sts,
+                "wafv2": mock_wafv2,
+            }
+            return clients.get(service, MagicMock())
+
+        mock_boto_client.side_effect = client_factory
+
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            waf_ip_set_name="test-blocklist",
+        )
+
+        # WAF will be disabled because the IP set wasn't found and create_waf_ip_set=False
+        self.assertFalse(blocker._waf_enabled)
+
+    @patch("boto3.client")
+    def test_waf_find_existing_ip_set(self, mock_boto_client):
+        """Test finding an existing WAF IP set by name"""
+        mock_ec2 = MagicMock()
+        mock_elbv2 = MagicMock()
+        mock_s3 = MagicMock()
+        mock_sts = MagicMock()
+        mock_wafv2 = MagicMock()
+
+        # Mock WAF IP set search (found)
+        mock_wafv2.get_paginator.return_value.paginate.return_value = [
+            {"IPSets": [{"Name": "test-blocklist", "Id": "abc-123"}]}
+        ]
+        mock_wafv2.get_ip_set.return_value = {
+            "IPSet": {"Name": "test-blocklist", "Addresses": []},
+            "LockToken": "lock-token-123"
+        }
+
+        def client_factory(service, **kwargs):
+            clients = {
+                "ec2": mock_ec2,
+                "elbv2": mock_elbv2,
+                "s3": mock_s3,
+                "sts": mock_sts,
+                "wafv2": mock_wafv2,
+            }
+            return clients.get(service, MagicMock())
+
+        mock_boto_client.side_effect = client_factory
+
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            waf_ip_set_name="test-blocklist",
+        )
+
+        self.assertTrue(blocker._waf_enabled)
+        self.assertEqual(blocker._waf_ip_set_id, "abc-123")
+
+    @patch("boto3.client")
+    def test_waf_get_statistics(self, mock_boto_client):
+        """Test WAF statistics when disabled"""
+        mock_ec2 = MagicMock()
+        mock_elbv2 = MagicMock()
+        mock_s3 = MagicMock()
+        mock_sts = MagicMock()
+
+        def client_factory(service, **kwargs):
+            clients = {
+                "ec2": mock_ec2,
+                "elbv2": mock_elbv2,
+                "s3": mock_s3,
+                "sts": mock_sts,
+            }
+            return clients.get(service, MagicMock())
+
+        mock_boto_client.side_effect = client_factory
+
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False
+        )
+
+        stats = blocker._get_waf_statistics()
+        self.assertFalse(stats["enabled"])
+
+    @patch("boto3.client")
+    def test_waf_cloudfront_uses_us_east_1(self, mock_boto_client):
+        """Test that CloudFront scope WAF uses us-east-1 region"""
+        mock_ec2 = MagicMock()
+        mock_elbv2 = MagicMock()
+        mock_s3 = MagicMock()
+        mock_sts = MagicMock()
+        mock_wafv2 = MagicMock()
+
+        # Mock WAF IP set search (not found)
+        mock_wafv2.get_paginator.return_value.paginate.return_value = [{"IPSets": []}]
+
+        regions_used = []
+
+        def client_factory(service, **kwargs):
+            if service == "wafv2":
+                regions_used.append(kwargs.get("region_name"))
+            clients = {
+                "ec2": mock_ec2,
+                "elbv2": mock_elbv2,
+                "s3": mock_s3,
+                "sts": mock_sts,
+                "wafv2": mock_wafv2,
+            }
+            return clients.get(service, MagicMock())
+
+        mock_boto_client.side_effect = client_factory
+
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test",
+            region="ap-southeast-2",  # Non-US region
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            waf_ip_set_name="test-blocklist",
+            waf_ip_set_scope="CLOUDFRONT",
+        )
+
+        # WAF client should have been created with us-east-1 for CloudFront
+        self.assertIn("us-east-1", regions_used)
+
+
+class TestLoggingAndMetrics(unittest.TestCase):
+    """Test structured logging and CloudWatch metrics"""
+
+    def test_json_formatter(self):
+        """Test JsonFormatter produces valid JSON"""
+        from auto_block_attackers import JsonFormatter
+        import json as json_mod
+
+        formatter = JsonFormatter()
+
+        # Create a mock log record
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=10,
+            msg="Test message",
+            args=(),
+            exc_info=None,
+        )
+
+        output = formatter.format(record)
+
+        # Should be valid JSON
+        parsed = json_mod.loads(output)
+        self.assertEqual(parsed["level"], "INFO")
+        self.assertEqual(parsed["message"], "Test message")
+        self.assertIn("timestamp", parsed)
+
+    def test_cloudwatch_metrics_disabled_by_default(self):
+        """Test CloudWatch metrics are disabled when not requested"""
+        from auto_block_attackers import CloudWatchMetrics
+
+        metrics = CloudWatchMetrics(enabled=False)
+        self.assertFalse(metrics.enabled)
+
+        # Should not raise when putting metrics while disabled
+        metrics.put_count("TestMetric", 1)
+        metrics.put_timing("TestTiming", 1.0)
+        metrics.flush()  # Should be a no-op
+
+    def test_cloudwatch_metrics_dry_run(self):
+        """Test CloudWatch metrics in dry run mode"""
+        from auto_block_attackers import CloudWatchMetrics
+
+        metrics = CloudWatchMetrics(enabled=True, dry_run=True)
+
+        # Put some metrics
+        metrics.put_count("TestMetric", 5, {"Region": "us-east-1"})
+        metrics.put_timing("TestTiming", 1.5)
+
+        # Flush should not raise in dry run mode
+        metrics.flush()
+
+        # Buffer should be cleared after flush
+        self.assertEqual(len(metrics._metric_buffer), 0)
+
+    @patch("boto3.client")
+    def test_nacl_blocker_with_json_logging(self, mock_boto_client):
+        """Test NaclAutoBlocker initializes with JSON logging"""
+        mock_ec2 = MagicMock()
+        mock_elbv2 = MagicMock()
+        mock_s3 = MagicMock()
+        mock_sts = MagicMock()
+
+        def client_factory(service, **kwargs):
+            clients = {
+                "ec2": mock_ec2,
+                "elbv2": mock_elbv2,
+                "s3": mock_s3,
+                "sts": mock_sts,
+            }
+            return clients.get(service, MagicMock())
+
+        mock_boto_client.side_effect = client_factory
+
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            json_logging=True,
+        )
+
+        # Verify metrics object is created
+        self.assertIsNotNone(blocker._metrics)
+        self.assertFalse(blocker._metrics.enabled)  # Not enabled by default
+
+    @patch("boto3.client")
+    def test_nacl_blocker_with_metrics_enabled(self, mock_boto_client):
+        """Test NaclAutoBlocker initializes with CloudWatch metrics enabled"""
+        mock_ec2 = MagicMock()
+        mock_elbv2 = MagicMock()
+        mock_s3 = MagicMock()
+        mock_sts = MagicMock()
+        mock_cloudwatch = MagicMock()
+
+        def client_factory(service, **kwargs):
+            clients = {
+                "ec2": mock_ec2,
+                "elbv2": mock_elbv2,
+                "s3": mock_s3,
+                "sts": mock_sts,
+                "cloudwatch": mock_cloudwatch,
+            }
+            return clients.get(service, MagicMock())
+
+        mock_boto_client.side_effect = client_factory
+
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            enable_cloudwatch_metrics=True,
+            cloudwatch_namespace="TestNamespace",
+        )
+
+        # Verify metrics object is created and enabled (though in dry_run)
+        self.assertIsNotNone(blocker._metrics)
+
+
+class TestMultiSignalDetection(unittest.TestCase):
+    """Test multi-signal threat detection"""
+
+    def test_threat_signals_initialization(self):
+        """Test ThreatSignals class initialization"""
+        from auto_block_attackers import ThreatSignals
+
+        signals = ThreatSignals()
+        self.assertEqual(signals.attack_pattern_hits, 0)
+        self.assertEqual(signals.scanner_ua_hits, 0)
+        self.assertEqual(signals.error_responses, 0)
+        self.assertEqual(signals.total_requests, 0)
+        self.assertEqual(len(signals.unique_paths), 0)
+
+    def test_threat_signals_add_request(self):
+        """Test adding requests to ThreatSignals"""
+        from auto_block_attackers import ThreatSignals
+
+        signals = ThreatSignals()
+        signals.add_request(
+            has_attack_pattern=True,
+            has_scanner_ua=True,
+            status_code=404,
+            path="/admin.php",
+        )
+
+        self.assertEqual(signals.attack_pattern_hits, 1)
+        self.assertEqual(signals.scanner_ua_hits, 1)
+        self.assertEqual(signals.error_responses, 1)
+        self.assertEqual(signals.total_requests, 1)
+        self.assertIn("/admin.php", signals.unique_paths)
+
+    def test_threat_signals_score_calculation(self):
+        """Test threat score calculation"""
+        from auto_block_attackers import ThreatSignals, DEFAULT_THREAT_SIGNALS_CONFIG
+
+        signals = ThreatSignals()
+
+        # Add 10 requests, all with attack patterns and from scanner
+        for i in range(10):
+            signals.add_request(
+                has_attack_pattern=True,
+                has_scanner_ua=True,
+                status_code=404,
+                path=f"/path{i}",
+            )
+
+        score, breakdown = signals.calculate_threat_score(DEFAULT_THREAT_SIGNALS_CONFIG)
+
+        # Should have high score
+        self.assertGreater(score, 60)
+        self.assertIn("attack_pattern", breakdown)
+        self.assertIn("scanner_ua", breakdown)
+
+    def test_threat_signals_benign_traffic(self):
+        """Test that benign traffic gets low threat score"""
+        from auto_block_attackers import ThreatSignals, DEFAULT_THREAT_SIGNALS_CONFIG
+
+        signals = ThreatSignals()
+
+        # Add 100 normal requests (no attack patterns, no scanner UA)
+        for i in range(100):
+            signals.add_request(
+                has_attack_pattern=False,
+                has_scanner_ua=False,
+                status_code=200,
+                path="/",
+            )
+
+        is_malicious, score, _ = signals.is_malicious(DEFAULT_THREAT_SIGNALS_CONFIG)
+
+        # Should NOT be considered malicious
+        self.assertFalse(is_malicious)
+        self.assertLess(score, DEFAULT_THREAT_SIGNALS_CONFIG["min_threat_score"])
+
+    def test_scanner_user_agent_pattern(self):
+        """Test SCANNER_USER_AGENTS pattern matching"""
+        from auto_block_attackers import SCANNER_USER_AGENTS
+
+        # Known scanner user agents
+        scanner_agents = [
+            "Mozilla/5.0 zgrab/0.x",
+            "Nmap Scripting Engine",
+            "sqlmap/1.5",
+            "python-requests/2.25",
+            "Go-http-client/1.1",
+            "Nikto/2.1.6",
+            "curl/7.68.0",
+            "wget/1.20.3",
+        ]
+
+        for ua in scanner_agents:
+            self.assertTrue(
+                bool(SCANNER_USER_AGENTS.search(ua)),
+                f"Should detect scanner UA: {ua}",
+            )
+
+        # Normal user agents
+        normal_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X)",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/537.36",
+        ]
+
+        for ua in normal_agents:
+            self.assertFalse(
+                bool(SCANNER_USER_AGENTS.search(ua)),
+                f"Should not flag normal UA: {ua}",
+            )
+
+    @patch("boto3.client")
+    def test_blocker_with_multi_signal_disabled(self, mock_boto_client):
+        """Test NaclAutoBlocker with multi-signal detection disabled"""
+        mock_ec2 = MagicMock()
+        mock_elbv2 = MagicMock()
+        mock_s3 = MagicMock()
+        mock_sts = MagicMock()
+
+        def client_factory(service, **kwargs):
+            clients = {
+                "ec2": mock_ec2,
+                "elbv2": mock_elbv2,
+                "s3": mock_s3,
+                "sts": mock_sts,
+            }
+            return clients.get(service, MagicMock())
+
+        mock_boto_client.side_effect = client_factory
+
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            enable_multi_signal=False,
+        )
+
+        self.assertFalse(blocker._enable_multi_signal)
+
+
+class TestEnhancedSlackNotifications(unittest.TestCase):
+    """Test enhanced Slack notification functionality"""
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_enhanced_slack_disabled_by_default(self, mock_boto_client):
+        """Test that enhanced Slack is disabled by default"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+        )
+
+        self.assertFalse(blocker._enhanced_slack)
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_enhanced_slack_enabled(self, mock_boto_client):
+        """Test that enhanced Slack can be enabled"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            enhanced_slack=True,
+        )
+
+        self.assertTrue(blocker._enhanced_slack)
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_tier_emoji_mapping(self, mock_boto_client):
+        """Test tier to emoji mapping"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+        )
+
+        self.assertEqual(blocker._get_tier_emoji("critical"), ":rotating_light:")
+        self.assertEqual(blocker._get_tier_emoji("high"), ":red_circle:")
+        self.assertEqual(blocker._get_tier_emoji("medium"), ":large_orange_circle:")
+        self.assertEqual(blocker._get_tier_emoji("low"), ":large_yellow_circle:")
+        self.assertEqual(blocker._get_tier_emoji("minimal"), ":white_circle:")
+        self.assertEqual(blocker._get_tier_emoji("unknown"), ":question:")
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_format_duration(self, mock_boto_client):
+        """Test duration formatting"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+        )
+
+        self.assertEqual(blocker._format_duration(72), "3d")
+        self.assertEqual(blocker._format_duration(24), "1d")
+        self.assertEqual(blocker._format_duration(12), "12h")
+        self.assertEqual(blocker._format_duration(1), "1h")
+        self.assertEqual(blocker._format_duration(0.5), "30m")
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_enhanced_notification_skips_dry_run(self, mock_boto_client):
+        """Test that enhanced notification skips in dry run mode"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=True,
+            debug=False,
+            enhanced_slack=True,
+            slack_token="test-token",
+            slack_channel="test-channel",
+        )
+
+        # Should not raise any errors
+        blocker._send_enhanced_slack_notification(
+            new_offenders={"1.2.3.4"},
+            final_blocked_ips={"1.2.3.4"},
+            ip_counts=Counter({"1.2.3.4": 100}),
+            initially_blocked_ips=set(),
+            active_blocks={"1.2.3.4": {"tier": "high", "block_duration_hours": 72}},
+        )
+
+    @patch('auto_block_attackers.boto3.client')
+    def test_enhanced_notification_skips_no_changes(self, mock_boto_client):
+        """Test that enhanced notification skips when no changes"""
+        blocker = NaclAutoBlocker(
+            lb_name_pattern="test-*",
+            region="us-east-1",
+            lookback_str="1h",
+            threshold=10,
+            start_rule=80,
+            limit=20,
+            whitelist_file=None,
+            aws_ip_ranges_file=None,
+            dry_run=False,
+            debug=False,
+            enhanced_slack=True,
+            slack_token="test-token",
+            slack_channel="test-channel",
+        )
+
+        # Mock the Slack client
+        blocker.slack_client = MagicMock()
+        blocker.slack_client.post_incident_notification = MagicMock(return_value="test_ts")
+
+        # Call with no changes (same blocked IPs)
+        blocker._send_enhanced_slack_notification(
+            new_offenders=set(),
+            final_blocked_ips={"1.2.3.4"},
+            ip_counts=Counter({"1.2.3.4": 100}),
+            initially_blocked_ips={"1.2.3.4"},  # Same as final
+            active_blocks={"1.2.3.4": {"tier": "high", "block_duration_hours": 72}},
+        )
+
+        # Should not have called post_incident_notification
+        blocker.slack_client.post_incident_notification.assert_not_called()
+
+
+class TestSlackClientEnhanced(unittest.TestCase):
+    """Test enhanced SlackClient functionality"""
+
+    def test_slack_severity_colors(self):
+        """Test SlackSeverity enum has correct colors"""
+        from slack_client import SlackSeverity
+
+        self.assertEqual(SlackSeverity.INFO.value, "#36a64f")
+        self.assertEqual(SlackSeverity.WARNING.value, "#f2c744")
+        self.assertEqual(SlackSeverity.LOW.value, "#ff9933")
+        self.assertEqual(SlackSeverity.MEDIUM.value, "#e07000")
+        self.assertEqual(SlackSeverity.HIGH.value, "#cc0000")
+        self.assertEqual(SlackSeverity.CRITICAL.value, "#8b0000")
+
+    def test_tier_to_severity_mapping(self):
+        """Test TIER_TO_SEVERITY mapping"""
+        from slack_client import TIER_TO_SEVERITY, SlackSeverity
+
+        self.assertEqual(TIER_TO_SEVERITY["minimal"], SlackSeverity.LOW)
+        self.assertEqual(TIER_TO_SEVERITY["low"], SlackSeverity.LOW)
+        self.assertEqual(TIER_TO_SEVERITY["medium"], SlackSeverity.MEDIUM)
+        self.assertEqual(TIER_TO_SEVERITY["high"], SlackSeverity.HIGH)
+        self.assertEqual(TIER_TO_SEVERITY["critical"], SlackSeverity.CRITICAL)
+
+    def test_slack_block_add_header(self):
+        """Test SlackBlock add_header method"""
+        from slack_client import SlackBlock
+
+        block = SlackBlock()
+        block.add_header("Test Header")
+
+        blocks = block.block
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["type"], "header")
+        self.assertEqual(blocks[0]["text"]["text"], "Test Header")
+
+    def test_slack_block_add_fields(self):
+        """Test SlackBlock add_fields method"""
+        from slack_client import SlackBlock
+
+        block = SlackBlock()
+        block.add_fields([("Label1", "Value1"), ("Label2", "Value2")])
+
+        blocks = block.block
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["type"], "section")
+        self.assertEqual(len(blocks[0]["fields"]), 2)
+
+    def test_slack_block_add_actions(self):
+        """Test SlackBlock add_actions method"""
+        from slack_client import SlackBlock
+
+        block = SlackBlock()
+        block.add_actions([
+            {"text": "Button 1", "action_id": "action1"},
+            {"text": "Button 2", "action_id": "action2", "style": "danger"},
+        ])
+
+        blocks = block.block
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["type"], "actions")
+        self.assertEqual(len(blocks[0]["elements"]), 2)
+
+    def test_slack_client_thread_tracking(self):
+        """Test SlackClient thread tracking"""
+        from slack_client import SlackClient
+
+        client = SlackClient(token="test", channel="test-channel")
+
+        # Initially no threads
+        self.assertIsNone(client.get_thread_ts("incident_1"))
+
+        # Set a thread
+        client.set_thread_ts("incident_1", "1234567890.123456")
+        self.assertEqual(client.get_thread_ts("incident_1"), "1234567890.123456")
+
+        # Clear the thread
+        client.clear_thread("incident_1")
+        self.assertIsNone(client.get_thread_ts("incident_1"))
 
 
 def run_tests():
@@ -439,6 +1212,11 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestNACLFilterFix))
     suite.addTests(loader.loadTestsFromTestCase(TestSlackIntegration))
     suite.addTests(loader.loadTestsFromTestCase(TestLogParsing))
+    suite.addTests(loader.loadTestsFromTestCase(TestWAFIntegration))
+    suite.addTests(loader.loadTestsFromTestCase(TestLoggingAndMetrics))
+    suite.addTests(loader.loadTestsFromTestCase(TestMultiSignalDetection))
+    suite.addTests(loader.loadTestsFromTestCase(TestEnhancedSlackNotifications))
+    suite.addTests(loader.loadTestsFromTestCase(TestSlackClientEnhanced))
 
     # Run tests
     runner = unittest.TextTestRunner(verbosity=2)

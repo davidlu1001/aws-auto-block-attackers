@@ -43,6 +43,7 @@ class TestIntegrationScenarios(unittest.TestCase):
             start_rule=80,
             limit=20,
             whitelist_file=None,
+            aws_ip_ranges_file=None,
             dry_run=True,
             debug=False
         )
@@ -91,6 +92,7 @@ class TestIntegrationScenarios(unittest.TestCase):
             start_rule=80,
             limit=20,
             whitelist_file=None,
+            aws_ip_ranges_file=None,
             dry_run=True,
             debug=False
         )
@@ -150,6 +152,7 @@ class TestIntegrationScenarios(unittest.TestCase):
             start_rule=80,
             limit=20,
             whitelist_file=None,
+            aws_ip_ranges_file=None,
             dry_run=True,
             debug=False
         )
@@ -179,6 +182,7 @@ class TestIntegrationScenarios(unittest.TestCase):
                 start_rule=80,
                 limit=20,
                 whitelist_file=whitelist_path,
+                aws_ip_ranges_file=None,
                 dry_run=True,
                 debug=False
             )
@@ -206,6 +210,7 @@ class TestIntegrationScenarios(unittest.TestCase):
             start_rule=80,
             limit=20,
             whitelist_file=None,
+            aws_ip_ranges_file=None,
             dry_run=True,
             debug=False
         )
@@ -220,6 +225,7 @@ class TestIntegrationScenarios(unittest.TestCase):
             start_rule=99,
             limit=10,  # Should cap at 100
             whitelist_file=None,
+            aws_ip_ranges_file=None,
             dry_run=True,
             debug=False
         )
@@ -234,6 +240,7 @@ class TestIntegrationScenarios(unittest.TestCase):
             start_rule=85,
             limit=50,  # Would go to 135, but capped
             whitelist_file=None,
+            aws_ip_ranges_file=None,
             dry_run=True,
             debug=False
         )
@@ -261,6 +268,7 @@ class TestIntegrationScenarios(unittest.TestCase):
                 start_rule=80,
                 limit=20,
                 whitelist_file=None,
+            aws_ip_ranges_file=None,
                 dry_run=True,
                 debug=False
             )
@@ -283,6 +291,7 @@ class TestIntegrationScenarios(unittest.TestCase):
             start_rule=80,
             limit=20,
             whitelist_file=None,
+            aws_ip_ranges_file=None,
             dry_run=True,
             debug=False
         )

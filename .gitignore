@@ -61,6 +61,7 @@ credentials.json
 # AWS
 .aws/
 aws-credentials
+ip-ranges.json
 
 # Registry and data files
 block_registry.json

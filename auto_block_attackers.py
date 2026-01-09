@@ -2525,7 +2525,7 @@ class NaclAutoBlocker:
         logging.info(f"Total active blocks in registry: {len(ips_to_block)}")
 
         logging.info("Step 7/7: Updating NACL rules with time-based blocks...")
-        self._update_nacl_rules_with_registry(nacl_id, ips_to_block, active_blocks)
+        ips_to_add, ips_to_remove = self._update_nacl_rules_with_registry(nacl_id, ips_to_block, active_blocks)
 
         # Sync blocked IPs to WAF IP Set (if enabled)
         if self._waf_enabled:
@@ -2539,7 +2539,8 @@ class NaclAutoBlocker:
         final_deny_rules, _ = self._get_nacl_rules(nacl_id)
         final_blocked_ips = {cidr.split("/")[0] for cidr in final_deny_rules.values()}
         self._generate_report(
-            ip_counts, new_offenders, final_blocked_ips, active_blocks
+            ip_counts, new_offenders, final_blocked_ips, active_blocks,
+            ips_to_add=ips_to_add, ips_to_remove=ips_to_remove
         )
 
         # Send summary notification to Slack (only if there were changes)
@@ -3033,6 +3034,12 @@ class NaclAutoBlocker:
         """
         Log threat score details at appropriate verbosity level.
 
+        Logging Strategy:
+        - BLOCKED: Always INFO + full details
+        - High-traffic skipped (>=100 hits OR >=2x threshold): INFO + full details + WARNING
+        - Borderline skipped (score within ±20 of threshold): INFO + full details
+        - Other skipped: DEBUG only (prevent log explosion)
+
         Args:
             ip: IP address being evaluated
             score: Final threat score
@@ -3045,26 +3052,43 @@ class NaclAutoBlocker:
                 - service_name: Verified legitimate service (if any)
             blocked: Whether the IP will be blocked
         """
-        status = "BLOCKED" if blocked else "SKIPPED (below threshold)"
-
         # Get breakdown components safely
         breakdown = details.get('breakdown', {})
         reasons_str = ', '.join(details.get('reasons', [])) if details.get('reasons') else 'no_specific_signals'
-
-        # Always log the summary at INFO level
         hit_count = details.get('hit_count', 0)
-        logging.info(
-            f"IP {ip}: score={score:.1f}, hits={hit_count}, "
-            f"status={status}, reasons=[{reasons_str}]"
-        )
+        service_name = details.get('service_name')
 
-        # Determine if this is a borderline case (within 20 points of threshold)
+        # Build status string with service name for skipped IPs
+        if blocked:
+            status = "BLOCKED"
+        elif service_name:
+            status = f"SKIPPED (score={score:.0f}, {service_name})"
+        else:
+            status = f"SKIPPED (score={score:.0f})"
+
+        # Determine logging level and detail requirements
         min_score = self._threat_signals_config.get('min_threat_score', 40)
         is_borderline = abs(score - min_score) <= 20
+        is_high_traffic = hit_count >= 100 or hit_count >= self.threshold * 2
 
-        # Log detailed breakdown in debug mode, or always for borderline cases
-        if self._debug or is_borderline:
-            base_score = details.get('base_score', score)
+        # Determine if we should log details
+        should_log_details = blocked or is_high_traffic or is_borderline or self._debug
+
+        # Log at appropriate level
+        if blocked or is_high_traffic or is_borderline:
+            logging.info(
+                f"IP {ip}: score={score:.1f}, hits={hit_count}, "
+                f"status={status}, reasons=[{reasons_str}]"
+            )
+        else:
+            # Low-traffic, non-borderline skipped IPs - DEBUG only
+            logging.debug(
+                f"IP {ip}: score={score:.1f}, hits={hit_count}, "
+                f"status={status}, reasons=[{reasons_str}]"
+            )
+
+        # Log detailed breakdown for relevant cases
+        if should_log_details:
             service_adj = details.get('service_adjustment', 0)
 
             logging.info(
@@ -3077,9 +3101,10 @@ class NaclAutoBlocker:
             )
 
             if service_adj != 0:
-                service_name = details.get('service_name', 'unknown')
+                svc_name = details.get('service_name', 'unknown')
+                verification_method = details.get('verification_method', 'unknown')
                 logging.info(
-                    f"  → Service adjustment: {service_adj} ({service_name})"
+                    f"  → Verified service: {svc_name} (via {verification_method})"
                 )
 
             aws_service = details.get('aws_service')
@@ -3092,14 +3117,16 @@ class NaclAutoBlocker:
             error_count = details.get('error_responses', 0)
             if attack_hits > 0 or scanner_hits > 0:
                 logging.info(
-                    f"  → Attack patterns: {attack_hits}, Scanner UAs: {scanner_hits}, Errors: {error_count}/{hit_count}"
+                    f"  → Attack patterns: {attack_hits}, Scanner UAs: {scanner_hits}, "
+                    f"Errors: {error_count}/{hit_count}"
                 )
 
         # Warn for high-hit IPs that were skipped (potential false negative)
-        if not blocked and hit_count >= 100:
+        if not blocked and is_high_traffic:
             logging.warning(
-                f"High-traffic IP {ip} ({hit_count} hits) was NOT blocked due to low threat score ({score:.1f}). "
-                f"Review if this is expected behavior. Reasons: [{reasons_str}]"
+                f"⚠️  High-traffic IP {ip} ({hit_count} hits) was NOT blocked. "
+                f"Score {score:.1f} < threshold {min_score}. "
+                f"Review if this is expected."
             )
 
     def _aggregate_threat_signals(
@@ -3674,9 +3701,12 @@ class NaclAutoBlocker:
 
     def _update_nacl_rules_with_registry(
         self, nacl_id: str, ips_to_block: Set[str], active_blocks: Dict[str, Dict]
-    ):
+    ) -> Tuple[Set[str], Set[str]]:
         """
         Updates NACL rules based on the persistent registry with priority-based slot management.
+
+        Returns:
+            Tuple of (ips_to_add, ips_to_remove) for summary reporting
         """
         existing_deny_rules, all_rule_nums = self._get_nacl_rules(nacl_id)
         existing_blocked_ips = {
@@ -3709,6 +3739,8 @@ class NaclAutoBlocker:
             self._manage_rule_limit_and_add_with_priority(
                 nacl_id, ips_to_add, active_blocks
             )
+
+        return ips_to_add, ips_to_remove
 
     def _manage_rule_limit_and_add_with_priority(
         self, nacl_id: str, ips_to_add: Set[str], active_blocks: Dict[str, Dict]
@@ -4660,7 +4692,10 @@ class NaclAutoBlocker:
             return "NO CHANGE (blocked)"
 
         if ip in skipped_ip_details:
-            score, _ = skipped_ip_details[ip]
+            score, details = skipped_ip_details[ip]
+            service_name = details.get('service_name') if details else None
+            if service_name:
+                return f"SKIPPED (score={score:.0f}, {service_name})"
             return f"SKIPPED (score={score:.0f})"
 
         if hits < self.threshold:

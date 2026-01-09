@@ -512,7 +512,7 @@ class TestDryRunSummary:
         )
         assert "NO CHANGE" in status
 
-        # Test skipped IP status
+        # Test skipped IP status (without service name)
         status = blocker._get_dry_run_status(
             ip="192.168.1.5",
             ips_to_add=ips_to_add,
@@ -523,6 +523,19 @@ class TestDryRunSummary:
         )
         assert "SKIPPED" in status
         assert "35" in status
+
+        # Test skipped IP status with service name
+        status = blocker._get_dry_run_status(
+            ip="192.168.1.6",
+            ips_to_add=ips_to_add,
+            ips_to_remove=ips_to_remove,
+            final_blocked_ips=final_blocked_ips,
+            skipped_ip_details={"192.168.1.6": (33.0, {"service_name": "Route53-Health-Check"})},
+            hits=300,
+        )
+        assert "SKIPPED" in status
+        assert "33" in status
+        assert "Route53-Health-Check" in status
 
 
 class TestThreatScoreLogging:
@@ -625,6 +638,7 @@ class TestThreatScoreLogging:
         assert "High-traffic IP" in captured.err
         assert "500 hits" in captured.err
         assert "NOT blocked" in captured.err
+        assert "⚠️" in captured.err  # Emoji indicator for warning
 
 
 if __name__ == "__main__":

@@ -130,10 +130,15 @@ from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ipaddress
 import fnmatch
-from typing import Set, List, Dict, Tuple, Optional
+from typing import Set, List, Dict, Tuple, Optional, Any
+from collections import defaultdict
+from dataclasses import dataclass, field
+from urllib.parse import urlparse
+import bisect
 import os
 import sys
 import ipinfo
+import requests
 
 # Import SlackClient from the same directory
 try:
@@ -193,6 +198,571 @@ SCANNER_USER_AGENTS = re.compile(
     r"java/\d|libwww-perl|lwp-trivial)",
     re.IGNORECASE,
 )
+
+# --- SUSPICIOUS USER AGENT PATTERNS (lower confidence than scanners) ---
+SUSPICIOUS_UA_PATTERNS = re.compile(
+    r"(python|java|php|ruby|perl|curl|wget|libwww|"
+    r"httpclient|okhttp|apache-http|axios|node-fetch)",
+    re.IGNORECASE,
+)
+
+# --- AWS IP RANGES CONFIGURATION ---
+AWS_IP_RANGES_URL = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+IP_RANGES_MAX_AGE_DAYS = 7  # Re-download if older than 7 days
+
+# AWS service names from ip-ranges.json
+# See: https://docs.aws.amazon.com/vpc/latest/userguide/aws-ip-ranges.html
+AWS_SERVICE_ROUTE53_HEALTHCHECKS = 'ROUTE53_HEALTHCHECKS'
+AWS_SERVICE_CLOUDFRONT = 'CLOUDFRONT'
+AWS_SERVICE_ELB = 'ELB'
+AWS_SERVICE_EC2 = 'EC2'
+AWS_SERVICE_AMAZON = 'AMAZON'
+
+# --- KNOWN LEGITIMATE SERVICES CONFIGURATION ---
+# SECURITY NOTE: No hardcoded IPs! AWS services verified via ip-ranges.json service tags.
+KNOWN_LEGITIMATE_SERVICES = {
+    'Route53-Health-Check': {
+        'ua_pattern': re.compile(r'^Amazon-Route53-Health-Check', re.IGNORECASE),
+        # Verify IP is from ROUTE53_HEALTHCHECKS service in ip-ranges.json
+        'aws_service': AWS_SERVICE_ROUTE53_HEALTHCHECKS,
+        'require_service_match': True,
+    },
+    'ELB-HealthChecker': {
+        'ua_pattern': re.compile(r'^ELB-HealthChecker', re.IGNORECASE),
+        'aws_service': AWS_SERVICE_ELB,
+        'require_service_match': True,
+    },
+    'CloudFront': {
+        'ua_pattern': re.compile(r'^Amazon CloudFront', re.IGNORECASE),
+        'aws_service': AWS_SERVICE_CLOUDFRONT,
+        'require_service_match': True,
+    },
+    # Non-AWS services: require path matching since we can't verify IPs
+    # These only get -15 (vs -25 for AWS), so even if spoofed, won't bypass threshold alone
+    'Datadog': {
+        'ua_pattern': re.compile(r'Datadog', re.IGNORECASE),
+        'expected_paths': ['/health', '/metrics', '/status', '/api/v1', '/info'],
+        'require_path_match': True,
+    },
+    'NewRelic': {
+        'ua_pattern': re.compile(r'NewRelic', re.IGNORECASE),
+        'expected_paths': ['/health', '/status', '/ping'],
+        'require_path_match': True,
+    },
+    'Pingdom': {
+        'ua_pattern': re.compile(r'Pingdom', re.IGNORECASE),
+        'expected_paths': ['/health', '/status', '/ping', '/'],
+        'require_path_match': True,
+    },
+    'UptimeRobot': {
+        'ua_pattern': re.compile(r'UptimeRobot', re.IGNORECASE),
+        'expected_paths': ['/health', '/status', '/'],
+        'require_path_match': True,
+    },
+}
+
+
+def get_ip_ranges_path() -> str:
+    """
+    Get appropriate path for ip-ranges.json based on environment.
+
+    - Lambda: /tmp (re-download on cold start, ~500ms, acceptable)
+    - ECS with EFS: /mnt/efs (persistent)
+    - EC2/VM: ./ip-ranges.json (persistent)
+
+    Note: We intentionally skip S3 caching to avoid IAM complexity.
+    The ~500ms download time on Lambda cold start is acceptable.
+    """
+    # Lambda environment
+    if os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
+        return '/tmp/ip-ranges.json'
+
+    # ECS with EFS mount
+    if os.path.exists('/mnt/efs') and os.access('/mnt/efs', os.W_OK):
+        return '/mnt/efs/cache/ip-ranges.json'
+
+    # Default: current directory
+    return './ip-ranges.json'
+
+
+def download_aws_ip_ranges(
+    file_path: str,
+    max_age_days: int = IP_RANGES_MAX_AGE_DAYS
+) -> Optional[Dict]:
+    """
+    Download AWS IP ranges if missing or stale.
+
+    Args:
+        file_path: Path to save the ip-ranges.json file
+        max_age_days: Re-download if file is older than this many days
+
+    Returns:
+        Parsed JSON data if successful, None otherwise
+    """
+    path = Path(file_path)
+    is_lambda = os.environ.get('AWS_LAMBDA_FUNCTION_NAME') is not None
+
+    # Check freshness (Lambda always re-downloads on cold start)
+    if path.exists() and not is_lambda:
+        file_age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
+        if file_age < timedelta(days=max_age_days):
+            logging.debug(f"AWS IP ranges fresh ({file_age.days}d old), loading from cache")
+            try:
+                with open(path) as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                logging.warning("Cached IP ranges corrupted, re-downloading")
+
+    # Download using requests
+    logging.info(f"Downloading AWS IP ranges from {AWS_IP_RANGES_URL}...")
+    try:
+        response = requests.get(
+            AWS_IP_RANGES_URL,
+            timeout=30,
+            headers={'User-Agent': 'aws-auto-block-attackers/2.0'}
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # Save for future use (skip on Lambda - /tmp is ephemeral anyway)
+        if not is_lambda:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'w') as f:
+                json.dump(data, f)
+            logging.info(
+                f"Successfully downloaded AWS IP ranges ({len(response.content) / 1024:.1f} KB) "
+                f"to {file_path}"
+            )
+        else:
+            logging.info(
+                f"Downloaded AWS IP ranges ({len(response.content) / 1024:.1f} KB) "
+                f"(Lambda env, not caching)"
+            )
+
+        return data
+
+    except requests.exceptions.Timeout:
+        logging.warning("Timeout downloading AWS IP ranges (30s)")
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Failed to download AWS IP ranges: {e}")
+    except json.JSONDecodeError as e:
+        logging.warning(f"Downloaded AWS IP ranges file is invalid JSON: {e}")
+    except Exception as e:
+        logging.warning(f"Unexpected error downloading AWS IP ranges: {e}")
+
+    # Fallback: try loading stale cache
+    if path.exists():
+        logging.info("Using stale cached IP ranges as fallback")
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    logging.warning(
+        "No AWS IP ranges available. AWS IPs will not be excluded. "
+        "Some legitimate AWS service traffic may be blocked."
+    )
+    return None
+
+
+@dataclass
+class AWSIPRangeIndex:
+    """
+    Sorted index for O(log N) AWS IP lookups with service mapping.
+
+    Features:
+    - Binary search for fast IP-in-range checks
+    - Service-based verification (e.g., is IP from ROUTE53_HEALTHCHECKS?)
+    - No hardcoded IPs - all data from ip-ranges.json
+
+    Performance: O(log N) per lookup, where N ≈ 10,000 ranges
+    """
+    # For general "is AWS IP" checks: List of (start_int, end_int, cidr_str)
+    ipv4_ranges: List[Tuple[int, int, str]] = field(default_factory=list)
+    ipv6_ranges: List[Tuple[int, int, str]] = field(default_factory=list)
+
+    # For service-specific checks: service_name -> List of (start_int, end_int)
+    service_ranges_v4: Dict[str, List[Tuple[int, int]]] = field(default_factory=lambda: defaultdict(list))
+    service_ranges_v6: Dict[str, List[Tuple[int, int]]] = field(default_factory=lambda: defaultdict(list))
+
+    # Statistics
+    total_ipv4: int = 0
+    total_ipv6: int = 0
+    services: Set[str] = field(default_factory=set)
+
+    # Lookup statistics
+    _lookup_hits: int = 0
+    _lookup_misses: int = 0
+
+    @classmethod
+    def from_json_data(cls, data: Dict) -> 'AWSIPRangeIndex':
+        """Build index from ip-ranges.json data."""
+        index = cls()
+
+        # Process IPv4 prefixes
+        for prefix in data.get('prefixes', []):
+            ip_prefix = prefix.get('ip_prefix')
+            service = prefix.get('service', 'UNKNOWN')
+
+            if not ip_prefix:
+                continue
+
+            try:
+                network = ipaddress.ip_network(ip_prefix, strict=False)
+                start_int = int(network.network_address)
+                end_int = int(network.broadcast_address)
+
+                index.ipv4_ranges.append((start_int, end_int, ip_prefix))
+                index.service_ranges_v4[service].append((start_int, end_int))
+                index.services.add(service)
+            except ValueError:
+                continue
+
+        # Process IPv6 prefixes
+        for prefix in data.get('ipv6_prefixes', []):
+            ip_prefix = prefix.get('ipv6_prefix')
+            service = prefix.get('service', 'UNKNOWN')
+
+            if not ip_prefix:
+                continue
+
+            try:
+                network = ipaddress.ip_network(ip_prefix, strict=False)
+                start_int = int(network.network_address)
+                end_int = int(network.broadcast_address)
+
+                index.ipv6_ranges.append((start_int, end_int, ip_prefix))
+                index.service_ranges_v6[service].append((start_int, end_int))
+                index.services.add(service)
+            except ValueError:
+                continue
+
+        # Sort all ranges for binary search
+        index.ipv4_ranges.sort(key=lambda x: x[0])
+        index.ipv6_ranges.sort(key=lambda x: x[0])
+
+        for service in index.service_ranges_v4:
+            index.service_ranges_v4[service].sort(key=lambda x: x[0])
+        for service in index.service_ranges_v6:
+            index.service_ranges_v6[service].sort(key=lambda x: x[0])
+
+        index.total_ipv4 = len(index.ipv4_ranges)
+        index.total_ipv6 = len(index.ipv6_ranges)
+
+        # Log summary of services
+        top_services = sorted(index.services)[:5]
+        logging.info(
+            f"Built AWS IP index: {index.total_ipv4} IPv4, {index.total_ipv6} IPv6 ranges, "
+            f"{len(index.services)} services ({', '.join(top_services)}...)"
+        )
+
+        return index
+
+    def is_aws_ip(self, ip_str: str) -> bool:
+        """
+        O(log N) check if IP belongs to any AWS range.
+
+        Args:
+            ip_str: IP address string (IPv4 or IPv6)
+
+        Returns:
+            True if IP is from AWS
+        """
+        result = self._bisect_lookup(ip_str) is not None
+        if result:
+            self._lookup_hits += 1
+        else:
+            self._lookup_misses += 1
+        return result
+
+    def is_from_service(self, ip_str: str, service_name: str) -> bool:
+        """
+        Check if IP belongs to a specific AWS service.
+
+        This enables dynamic verification without hardcoded IPs.
+        Service names come from ip-ranges.json (e.g., 'ROUTE53_HEALTHCHECKS', 'CLOUDFRONT').
+
+        Args:
+            ip_str: IP address to check
+            service_name: AWS service name from ip-ranges.json
+
+        Returns:
+            True if IP belongs to the specified service
+        """
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            ip_int = int(ip)
+
+            if ip.version == 4:
+                ranges = self.service_ranges_v4.get(service_name, [])
+            else:
+                ranges = self.service_ranges_v6.get(service_name, [])
+
+            if not ranges:
+                return False
+
+            # Binary search in service-specific ranges
+            starts = [r[0] for r in ranges]
+            idx = bisect.bisect_right(starts, ip_int) - 1
+
+            if idx < 0:
+                return False
+
+            start_int, end_int = ranges[idx]
+            return start_int <= ip_int <= end_int
+
+        except ValueError:
+            return False
+
+    def get_service_for_ip(self, ip_str: str) -> Optional[str]:
+        """
+        Get the AWS service name for an IP address.
+
+        Args:
+            ip_str: IP address to check
+
+        Returns:
+            Service name if found, None otherwise
+        """
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            ip_int = int(ip)
+
+            service_ranges = self.service_ranges_v4 if ip.version == 4 else self.service_ranges_v6
+
+            for service_name, ranges in service_ranges.items():
+                if not ranges:
+                    continue
+
+                starts = [r[0] for r in ranges]
+                idx = bisect.bisect_right(starts, ip_int) - 1
+
+                if idx < 0:
+                    continue
+
+                start_int, end_int = ranges[idx]
+                if start_int <= ip_int <= end_int:
+                    return service_name
+
+            return None
+
+        except ValueError:
+            return None
+
+    def _bisect_lookup(self, ip_str: str) -> Optional[str]:
+        """
+        Binary search for IP in all ranges.
+
+        Returns matching CIDR or None.
+        """
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            ip_int = int(ip)
+
+            ranges = self.ipv4_ranges if ip.version == 4 else self.ipv6_ranges
+
+            if not ranges:
+                return None
+
+            # Binary search: find rightmost range where start <= ip_int
+            starts = [r[0] for r in ranges]
+            idx = bisect.bisect_right(starts, ip_int) - 1
+
+            if idx < 0:
+                return None
+
+            start_int, end_int, cidr = ranges[idx]
+
+            if start_int <= ip_int <= end_int:
+                return cidr
+
+            return None
+
+        except ValueError:
+            return None
+
+    def get_lookup_stats(self) -> Tuple[int, int, float]:
+        """
+        Get lookup statistics.
+
+        Returns:
+            Tuple of (hits, misses, hit_rate_percent)
+        """
+        total = self._lookup_hits + self._lookup_misses
+        hit_rate = (self._lookup_hits / total * 100) if total > 0 else 0.0
+        return self._lookup_hits, self._lookup_misses, hit_rate
+
+
+# Module-level index (singleton)
+_aws_ip_index: Optional[AWSIPRangeIndex] = None
+
+
+def _clean_path(url_or_path: str) -> str:
+    """
+    Extract and clean the path component from a URL or path string.
+
+    Removes query parameters and fragments to prevent bypass attempts like:
+    /login?redirect=/health  (would incorrectly match '/health' if not cleaned)
+
+    Args:
+        url_or_path: Full URL or path string
+
+    Returns:
+        Clean path without query params or fragments
+    """
+    # Handle full URLs
+    if '://' in url_or_path:
+        parsed = urlparse(url_or_path)
+        path = parsed.path
+    else:
+        # Just a path - split off query string
+        path = url_or_path.split('?')[0].split('#')[0]
+
+    # Normalize: ensure leading slash, remove trailing slash (except for root)
+    if not path.startswith('/'):
+        path = '/' + path
+    if path != '/' and path.endswith('/'):
+        path = path.rstrip('/')
+
+    return path
+
+
+def _path_matches(req_path: str, expected_path: str) -> bool:
+    """
+    Check if request path matches expected path (prefix match).
+
+    More secure than simple 'in' check:
+    - /health matches /health, /health/check, /healthz
+    - /health does NOT match /login?ref=/health
+
+    Args:
+        req_path: Actual request path (will be cleaned)
+        expected_path: Expected path pattern
+
+    Returns:
+        True if path matches
+    """
+    clean_req = _clean_path(req_path)
+    clean_expected = expected_path.rstrip('/')
+
+    # Exact match
+    if clean_req == clean_expected:
+        return True
+
+    # Prefix match (e.g., /health matches /health/check)
+    if clean_expected and clean_req.startswith(clean_expected + '/'):
+        return True
+
+    # Root path special case
+    if clean_expected == '/' and clean_req == '/':
+        return True
+
+    return False
+
+
+def verify_legitimate_service(
+    ip: str,
+    ua: str,
+    request_paths: List[str],
+    aws_index: Optional[AWSIPRangeIndex] = None
+) -> Tuple[int, Optional[str], Optional[str]]:
+    """
+    Verify if traffic is from a known legitimate service.
+
+    SECURITY: NEVER trusts UA alone. Requires secondary verification:
+    - AWS services: IP must belong to correct AWS service (dynamic lookup via ip-ranges.json)
+    - Non-AWS services: Request paths must match expected patterns (cleaned, no query params)
+
+    FAIL-CLOSED: If aws_index is unavailable, AWS services cannot be verified.
+    This may cause false positives but maintains security.
+
+    Args:
+        ip: Client IP address
+        ua: User-Agent string
+        request_paths: List of request paths/URLs from this IP
+        aws_index: AWSIPRangeIndex for service verification (built from ip-ranges.json)
+
+    Returns:
+        (score_adjustment, service_name, verification_method)
+        - score_adjustment: Negative value to reduce threat score (-25 for AWS, -15 for path match)
+        - service_name: Name of verified service, or None
+        - verification_method: How it was verified ('aws_service', 'path_match', None)
+    """
+    if not ua:
+        return 0, None, None
+
+    for service_name, config in KNOWN_LEGITIMATE_SERVICES.items():
+        # Step 1: Check UA pattern (anchored patterns prevent injection like "Evil-Amazon-Route53...")
+        if not config['ua_pattern'].search(ua):
+            continue
+
+        # UA matched - now REQUIRE secondary verification (don't trust UA alone!)
+
+        # Step 2a: AWS service verification (dynamic, no hardcoded IPs)
+        if config.get('require_service_match'):
+            aws_service = config.get('aws_service')
+
+            if aws_index is None:
+                # FAIL-CLOSED: Can't verify without index - don't give negative score
+                # This is intentional: security over availability
+                logging.warning(
+                    f"UA matches {service_name} but AWS IP index unavailable. "
+                    f"Cannot verify IP {ip}. This may cause false positive. "
+                    f"Check if ip-ranges.json download failed."
+                )
+                continue
+
+            if aws_service and aws_index.is_from_service(ip, aws_service):
+                # VERIFIED: UA + IP matches AWS service
+                logging.debug(
+                    f"Verified legitimate AWS service: {service_name} "
+                    f"(IP {ip} confirmed in {aws_service} range)"
+                )
+                return -25, service_name, 'aws_service'
+            else:
+                # SUSPICIOUS: UA claims to be AWS service but IP doesn't match!
+                logging.warning(
+                    f"SPOOFING ALERT: UA claims to be {service_name} but IP {ip} "
+                    f"is NOT in {aws_service} range. Possible attack vector."
+                )
+                # Don't give negative score - likely spoofing attempt
+                continue
+
+        # Step 2b: Path-based verification (for non-AWS services like Datadog)
+        # Uses cleaned paths to prevent bypass via query params
+        if config.get('require_path_match'):
+            expected_paths = config.get('expected_paths', [])
+
+            # Check if any request path matches expected patterns
+            path_matched = False
+            matched_path = None
+            for req_path in request_paths:
+                for expected in expected_paths:
+                    if _path_matches(req_path, expected):
+                        path_matched = True
+                        matched_path = expected
+                        break
+                if path_matched:
+                    break
+
+            if path_matched:
+                logging.debug(
+                    f"Verified legitimate service: {service_name} "
+                    f"(UA + path '{matched_path}' match)"
+                )
+                return -15, service_name, 'path_match'
+            else:
+                # UA matches but paths don't - be cautious
+                sample_paths = [_clean_path(p) for p in request_paths[:3]]
+                logging.debug(
+                    f"UA claims {service_name} but paths {sample_paths} "
+                    f"don't match expected {expected_paths}. Not giving negative score."
+                )
+                continue
+
+    return 0, None, None
+
 
 # --- MULTI-SIGNAL THREAT DETECTION CONFIGURATION ---
 DEFAULT_THREAT_SIGNALS_CONFIG = {
@@ -582,6 +1152,10 @@ def load_aws_ip_ranges(
 
     Returns:
         Tuple of (IPv4 networks set, IPv6 networks set) for efficient IP membership testing.
+
+    Note:
+        This function is maintained for backward compatibility.
+        For O(log N) lookups with service verification, use load_aws_ip_ranges_with_index().
     """
     if not file_path:
         return set(), set()
@@ -628,6 +1202,109 @@ def load_aws_ip_ranges(
     except Exception as e:
         logging.warning(f"Error loading AWS IP ranges from {file_path}: {e}")
         return set(), set()
+
+
+def load_aws_ip_ranges_with_index(
+    file_path: Optional[str] = None,
+    auto_download: bool = True,
+) -> Tuple[Optional[AWSIPRangeIndex], Set[ipaddress.IPv4Network], Set[ipaddress.IPv6Network]]:
+    """
+    Load AWS IP ranges with O(log N) index and optional auto-download.
+
+    This function provides:
+    - Auto-download of ip-ranges.json if missing or stale
+    - O(log N) bisect-based lookups via AWSIPRangeIndex
+    - Service-based IP verification (Route53 health checks, CloudFront, etc.)
+    - Backward-compatible network sets for legacy code
+
+    Args:
+        file_path: Path to ip-ranges.json file. If None, uses environment-appropriate default.
+        auto_download: If True, download the file if missing or stale (default: True).
+                       Set to False for air-gapped environments.
+
+    Returns:
+        Tuple of (AWSIPRangeIndex, IPv4 network set, IPv6 network set)
+        - AWSIPRangeIndex: For O(log N) lookups and service verification. None if loading failed.
+        - IPv4 networks: Set for backward compatibility
+        - IPv6 networks: Set for backward compatibility
+    """
+    global _aws_ip_index
+
+    # Determine file path
+    if file_path is None:
+        file_path = get_ip_ranges_path()
+
+    # Try to load or download data
+    data = None
+    if auto_download:
+        data = download_aws_ip_ranges(file_path)
+    else:
+        # Load without downloading
+        path = Path(file_path)
+        if path.exists():
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                logging.info(f"Loaded AWS IP ranges from {file_path}")
+            except Exception as e:
+                logging.warning(f"Failed to load {file_path}: {e}")
+        else:
+            logging.warning(
+                f"AWS IP ranges file not found: {file_path}. "
+                f"Use --no-auto-download-ip-ranges=false to auto-download."
+            )
+
+    if not data:
+        return None, set(), set()
+
+    # Build the index
+    _aws_ip_index = AWSIPRangeIndex.from_json_data(data)
+
+    # Also build network sets for backward compatibility
+    aws_ipv4_networks = set()
+    aws_ipv6_networks = set()
+
+    for prefix in data.get("prefixes", []):
+        ip_prefix = prefix.get("ip_prefix")
+        if ip_prefix and "/" in ip_prefix:
+            try:
+                network = ipaddress.ip_network(ip_prefix, strict=False)
+                if network.version == 4:
+                    aws_ipv4_networks.add(network)
+            except ValueError:
+                continue
+
+    for prefix in data.get("ipv6_prefixes", []):
+        ip_prefix = prefix.get("ipv6_prefix")
+        if ip_prefix and "/" in ip_prefix:
+            try:
+                network = ipaddress.ip_network(ip_prefix, strict=False)
+                if network.version == 6:
+                    aws_ipv6_networks.add(network)
+            except ValueError:
+                continue
+
+    return _aws_ip_index, aws_ipv4_networks, aws_ipv6_networks
+
+
+def is_aws_ip_fast(ip_str: str, aws_index: Optional[AWSIPRangeIndex] = None) -> bool:
+    """
+    O(log N) check if IP belongs to AWS ranges using bisect-based index.
+
+    This is the preferred method for production use. Falls back to False if
+    no index is available.
+
+    Args:
+        ip_str: IP address string to check
+        aws_index: Optional AWSIPRangeIndex. If None, uses global _aws_ip_index.
+
+    Returns:
+        True if the IP belongs to AWS, False otherwise.
+    """
+    index = aws_index or _aws_ip_index
+    if index is None:
+        return False
+    return index.is_aws_ip(ip_str)
 
 
 def is_aws_ip(
@@ -714,6 +1391,8 @@ class NaclAutoBlocker:
         athena_enabled: bool = False,
         athena_database: str = "alb_logs",
         athena_output_location: Optional[str] = None,
+        # Auto-download AWS IP ranges
+        auto_download_ip_ranges: bool = True,
     ):
         setup_logging(debug, json_format=json_logging)
         logging.info("Initializing NaclAutoBlocker...")
@@ -747,10 +1426,17 @@ class NaclAutoBlocker:
         logging.info("Loading whitelist and AWS IP ranges...")
         self.whitelist = self._load_whitelist(whitelist_file)
 
-        # Load both IPv4 and IPv6 AWS networks
-        self.aws_ipv4_networks, self.aws_ipv6_networks = load_aws_ip_ranges(aws_ip_ranges_file)
+        # Load AWS IP ranges with O(log N) index and optional auto-download
+        self._auto_download_ip_ranges = auto_download_ip_ranges
+        self.aws_ip_index, self.aws_ipv4_networks, self.aws_ipv6_networks = load_aws_ip_ranges_with_index(
+            file_path=aws_ip_ranges_file,
+            auto_download=auto_download_ip_ranges,
+        )
         # Keep backward compatibility
         self.aws_networks = self.aws_ipv4_networks
+
+        # Store debug mode for logging control
+        self._debug = debug
 
         self.dry_run = dry_run
 
@@ -804,6 +1490,9 @@ class NaclAutoBlocker:
 
         # S3 processing error tracking
         self._s3_processing_errors = 0
+
+        # Skipped IPs tracking (for dry-run summary)
+        self._skipped_ips: List[Tuple[str, float, Dict[str, Any]]] = []
 
         # Incremental log processing state
         self._force_reprocess = force_reprocess
@@ -2334,6 +3023,85 @@ class NaclAutoBlocker:
             self._s3_processing_errors += 1
             return {}
 
+    def _log_threat_score_details(
+        self,
+        ip: str,
+        score: float,
+        details: Dict[str, Any],
+        blocked: bool
+    ):
+        """
+        Log threat score details at appropriate verbosity level.
+
+        Args:
+            ip: IP address being evaluated
+            score: Final threat score
+            details: Dict with breakdown details including:
+                - hit_count: Total requests from IP
+                - reasons: List of reason strings
+                - breakdown: Score component breakdown
+                - base_score: Score before service adjustment
+                - final_score: Score after service adjustment
+                - service_name: Verified legitimate service (if any)
+            blocked: Whether the IP will be blocked
+        """
+        status = "BLOCKED" if blocked else "SKIPPED (below threshold)"
+
+        # Get breakdown components safely
+        breakdown = details.get('breakdown', {})
+        reasons_str = ', '.join(details.get('reasons', [])) if details.get('reasons') else 'no_specific_signals'
+
+        # Always log the summary at INFO level
+        hit_count = details.get('hit_count', 0)
+        logging.info(
+            f"IP {ip}: score={score:.1f}, hits={hit_count}, "
+            f"status={status}, reasons=[{reasons_str}]"
+        )
+
+        # Determine if this is a borderline case (within 20 points of threshold)
+        min_score = self._threat_signals_config.get('min_threat_score', 40)
+        is_borderline = abs(score - min_score) <= 20
+
+        # Log detailed breakdown in debug mode, or always for borderline cases
+        if self._debug or is_borderline:
+            base_score = details.get('base_score', score)
+            service_adj = details.get('service_adjustment', 0)
+
+            logging.info(
+                f"  → Score breakdown: "
+                f"pattern={breakdown.get('attack_pattern', 0):.1f}, "
+                f"scanner_ua={breakdown.get('scanner_ua', 0):.1f}, "
+                f"error_rate={breakdown.get('error_rate', 0):.1f}, "
+                f"path_diversity={breakdown.get('path_diversity', 0):.1f}, "
+                f"rate={breakdown.get('rate', 0):.1f}"
+            )
+
+            if service_adj != 0:
+                service_name = details.get('service_name', 'unknown')
+                logging.info(
+                    f"  → Service adjustment: {service_adj} ({service_name})"
+                )
+
+            aws_service = details.get('aws_service')
+            if aws_service:
+                logging.info(f"  → AWS service detected: {aws_service}")
+
+            # Log attack pattern and scanner details
+            attack_hits = details.get('attack_pattern_hits', 0)
+            scanner_hits = details.get('scanner_ua_hits', 0)
+            error_count = details.get('error_responses', 0)
+            if attack_hits > 0 or scanner_hits > 0:
+                logging.info(
+                    f"  → Attack patterns: {attack_hits}, Scanner UAs: {scanner_hits}, Errors: {error_count}/{hit_count}"
+                )
+
+        # Warn for high-hit IPs that were skipped (potential false negative)
+        if not blocked and hit_count >= 100:
+            logging.warning(
+                f"High-traffic IP {ip} ({hit_count} hits) was NOT blocked due to low threat score ({score:.1f}). "
+                f"Review if this is expected behavior. Reasons: [{reasons_str}]"
+            )
+
     def _aggregate_threat_signals(
         self, signal_dicts: List[Dict[str, ThreatSignals]]
     ) -> Dict[str, ThreatSignals]:
@@ -2414,6 +3182,7 @@ class NaclAutoBlocker:
 
         # Filter candidates based on threat scores
         confirmed_offenders = set()
+        skipped_ips: List[Tuple[str, float, Dict[str, Any]]] = []
 
         for ip in candidate_ips:
             if ip not in aggregated:
@@ -2423,21 +3192,73 @@ class NaclAutoBlocker:
                 continue
 
             signals = aggregated[ip]
-            is_malicious, score, breakdown = signals.is_malicious(self._threat_signals_config)
+            is_malicious_base, base_score, breakdown = signals.is_malicious(self._threat_signals_config)
 
-            if is_malicious:
+            # Enhanced details for logging
+            details: Dict[str, Any] = {
+                'base_score': base_score,
+                'breakdown': breakdown,
+                'hit_count': signals.total_requests,
+                'reasons': [],
+                'top_user_agents': list(signals.unique_paths)[:3] if hasattr(signals, 'unique_paths') else [],
+                'attack_pattern_hits': signals.attack_pattern_hits,
+                'scanner_ua_hits': signals.scanner_ua_hits,
+                'error_responses': signals.error_responses,
+            }
+
+            # Add reasons based on signal breakdown
+            if breakdown.get('attack_pattern', 0) > 0:
+                details['reasons'].append(f"attack_patterns ({signals.attack_pattern_hits} hits)")
+            if breakdown.get('scanner_ua', 0) > 0:
+                details['reasons'].append(f"scanner_ua ({signals.scanner_ua_hits} hits)")
+            if breakdown.get('error_rate', 0) > 0:
+                error_ratio = signals.error_responses / signals.total_requests if signals.total_requests else 0
+                details['reasons'].append(f"high_error_rate ({error_ratio:.0%})")
+            if breakdown.get('path_diversity', 0) > 0:
+                details['reasons'].append(f"path_scanning ({len(signals.unique_paths)} unique paths)")
+
+            # Check for legitimate service verification (reduces false positives)
+            service_adjustment = 0
+            service_name = None
+            verification_method = None
+
+            # Get sample request data for service verification
+            sample_paths = list(signals.unique_paths)[:20] if hasattr(signals, 'unique_paths') else []
+            # For service verification, we need to check if this looks like a legitimate service
+            # Since we don't have the actual UA here, we check using basic heuristics
+            # The full verification would happen at request parsing time
+            if self.aws_ip_index is not None:
+                # Check if IP belongs to any known AWS service
+                aws_service = self.aws_ip_index.get_service_for_ip(ip)
+                if aws_service:
+                    details['aws_service'] = aws_service
+                    # Only give score reduction for health check services
+                    if aws_service in [AWS_SERVICE_ROUTE53_HEALTHCHECKS, AWS_SERVICE_ELB]:
+                        service_adjustment = -15
+                        service_name = aws_service
+                        verification_method = 'aws_service_ip'
+                        details['reasons'].append(f"aws_service_ip ({aws_service})")
+                        details['service_adjustment'] = service_adjustment
+
+            # Calculate final score with service adjustment
+            final_score = max(0, base_score + service_adjustment)
+            details['final_score'] = final_score
+            details['service_name'] = service_name
+            details['verification_method'] = verification_method
+
+            # Determine if malicious based on final score
+            min_score = self._threat_signals_config['min_threat_score']
+            is_malicious_final = final_score >= min_score
+
+            if is_malicious_final:
                 confirmed_offenders.add(ip)
-                logging.debug(
-                    f"IP {ip}: threat score {score:.1f} - CONFIRMED "
-                    f"(patterns: {breakdown.get('attack_pattern', 0):.1f}, "
-                    f"scanner_ua: {breakdown.get('scanner_ua', 0):.1f}, "
-                    f"errors: {breakdown.get('error_rate', 0):.1f})"
-                )
+                self._log_threat_score_details(ip, final_score, details, blocked=True)
             else:
-                logging.info(
-                    f"IP {ip}: threat score {score:.1f} < {self._threat_signals_config['min_threat_score']} "
-                    f"- likely false positive, skipping block"
-                )
+                skipped_ips.append((ip, final_score, details))
+                self._log_threat_score_details(ip, final_score, details, blocked=False)
+
+        # Store skipped IPs for dry-run summary
+        self._skipped_ips = skipped_ips
 
         # Emit metrics for threat scores
         if aggregated:
@@ -3668,30 +4489,70 @@ class NaclAutoBlocker:
         offenders: Set[str],
         final_blocked_ips: Set[str],
         active_blocks: Optional[Dict[str, Dict]] = None,
+        ips_to_add: Optional[Set[str]] = None,
+        ips_to_remove: Optional[Set[str]] = None,
     ):
-        """Prints a final summary table of actions taken."""
+        """
+        Prints a final summary table of actions taken or planned.
+
+        In dry-run mode, shows expected state changes rather than current state.
+
+        Args:
+            ip_counts: Counter of IP addresses and their hit counts
+            offenders: Set of IPs that should be blocked
+            final_blocked_ips: Set of IPs currently blocked
+            active_blocks: Dict of active block registry entries
+            ips_to_add: IPs that will be added to blocklist (dry-run tracking)
+            ips_to_remove: IPs that will be removed from blocklist (dry-run tracking)
+        """
         print("\n--- SCRIPT EXECUTION SUMMARY ---")
+
+        if self.dry_run:
+            print("(DRY RUN - showing planned changes, no actual modifications made)\n")
+
+        # Use sets for comparison
+        ips_to_add = ips_to_add or set()
+        ips_to_remove = ips_to_remove or set()
+
+        # Build skipped IPs lookup
+        skipped_ip_details: Dict[str, Tuple[float, Dict]] = {}
+        for ip, score, details in self._skipped_ips:
+            skipped_ip_details[ip] = (score, details)
+
         if active_blocks:
             print(
-                f"{'IP Address':<20} {'Hits':<10} {'Tier':<12} {'Status':<25} {'Block Until':<20}"
+                f"{'IP Address':<20} {'Hits':<10} {'Tier':<12} {'Status':<30} {'Block Until':<20}"
             )
-            print("-" * 87)
+            print("-" * 92)
         else:
-            print(f"{'IP Address':<20} {'Malicious Hits':<15} {'Status':<20}")
-            print("-" * 55)
+            print(f"{'IP Address':<20} {'Malicious Hits':<15} {'Status':<30}")
+            print("-" * 65)
 
-        # Include IPs from recent detection and registry
-        all_detected_ips = {
-            ip for ip, count in ip_counts.items() if count >= self.threshold
-        }
-        report_ips = all_detected_ips.union(final_blocked_ips)
+        # Collect all IPs to report
+        report_ips = set()
 
-        # If using registry, include all active blocks
+        # IPs detected in this run (above threshold)
+        detected_ips = {ip for ip, count in ip_counts.items() if count >= self.threshold}
+        report_ips.update(detected_ips)
+
+        # Currently blocked IPs
+        report_ips.update(final_blocked_ips)
+
+        # IPs in active blocks registry
         if active_blocks:
-            report_ips = report_ips.union(set(active_blocks.keys()))
+            report_ips.update(active_blocks.keys())
+
+        # IPs that will be added/removed
+        report_ips.update(ips_to_add)
+        report_ips.update(ips_to_remove)
+
+        # Include skipped IPs in report
+        report_ips.update(skipped_ip_details.keys())
 
         sorted_report_ips = sorted(
-            list(report_ips), key=lambda ip: ip_counts.get(ip, 0), reverse=True
+            list(report_ips),
+            key=lambda ip: (ip_counts.get(ip, 0), ip),
+            reverse=True,
         )
 
         if not sorted_report_ips and ip_counts:
@@ -3700,46 +4561,138 @@ class NaclAutoBlocker:
             )
 
         for ip in sorted_report_ips:
-            status = "NOT BLOCKED (Below Threshold)"
-            if ip in self.whitelist:
-                status = "WHITELISTED"
-            elif is_aws_ip(ip, self.aws_networks):
-                status = "AWS IP (Excluded)"
-            elif ip in final_blocked_ips:
-                status = "ACTIVE BLOCK"
-            elif ip in offenders:
-                status = "SHOULD BE BLOCKED"
+            # Determine status based on dry-run vs live-run
+            if self.dry_run:
+                status = self._get_dry_run_status(
+                    ip,
+                    ips_to_add=ips_to_add,
+                    ips_to_remove=ips_to_remove,
+                    final_blocked_ips=final_blocked_ips,
+                    skipped_ip_details=skipped_ip_details,
+                    hits=ip_counts.get(ip, 0),
+                )
+            else:
+                status = self._get_live_run_status(
+                    ip,
+                    final_blocked_ips=final_blocked_ips,
+                    offenders=offenders,
+                    hits=ip_counts.get(ip, 0),
+                )
 
             hits = ip_counts.get(ip, 0)
+            tier = ""
+            block_until_str = ""
 
             if active_blocks and ip in active_blocks:
                 # Enhanced display with tier info
                 tier = active_blocks[ip].get("tier", "unknown")
                 block_until = active_blocks[ip].get("block_until", "unknown")
 
-                # Format block_until
+                # Format block_until in local timezone
                 try:
                     block_until_dt = datetime.fromisoformat(block_until)
                     if block_until_dt.tzinfo is None:
                         block_until_dt = block_until_dt.replace(tzinfo=timezone.utc)
-                    block_until_str = block_until_dt.strftime("%Y-%m-%d %H:%M")
+                    # Show in local time with timezone indicator
+                    local_dt = block_until_dt.astimezone()
+                    block_until_str = local_dt.strftime("%Y-%m-%d %H:%M %Z")
                 except Exception:
-                    block_until_str = "unknown"
+                    block_until_str = str(block_until) if block_until else ""
 
                 # Show total hits from registry if no recent hits
                 if hits == 0:
                     hits = active_blocks[ip].get("total_hits", 0)
 
+            if active_blocks:
                 print(
-                    f"{ip:<20} {str(hits):<10} {tier:<12} {status:<25} {block_until_str:<20}"
+                    f"{ip:<20} {str(hits):<10} {tier:<12} {status:<30} {block_until_str:<20}"
                 )
             else:
-                print(f"{ip:<20} {str(hits):<15} {status:<20}")
+                print(f"{ip:<20} {str(hits):<15} {status:<30}")
 
+        # Print separator
         if active_blocks:
-            print("-" * 87)
+            print("-" * 92)
         else:
-            print("-" * 55)
+            print("-" * 65)
+
+        # Print legend for dry-run mode
+        if self.dry_run:
+            print("\nLegend:")
+            print("  → WILL BE BLOCKED    = New block to be added")
+            print("  → WILL BE UNBLOCKED  = Expired block to be removed")
+            print("  NO CHANGE (blocked)  = Currently blocked, no change needed")
+            print("  SKIPPED (score=XX)   = Below threat score threshold")
+
+        # Log AWS IP lookup stats if available
+        if self.aws_ip_index is not None:
+            hits, misses, hit_rate = self.aws_ip_index.get_lookup_stats()
+            if hits + misses > 0:
+                logging.info(
+                    f"AWS IP lookup stats: {hits} lookups performed, "
+                    f"{misses} unique IPs checked"
+                )
+
+    def _get_dry_run_status(
+        self,
+        ip: str,
+        ips_to_add: Set[str],
+        ips_to_remove: Set[str],
+        final_blocked_ips: Set[str],
+        skipped_ip_details: Dict[str, Tuple[float, Dict]],
+        hits: int,
+    ) -> str:
+        """Determine display status for dry-run mode."""
+
+        if ip in self.whitelist:
+            return "WHITELISTED"
+
+        if is_aws_ip_fast(ip, self.aws_ip_index):
+            return "AWS IP (excluded)"
+
+        if ip in ips_to_add:
+            return "→ WILL BE BLOCKED"
+
+        if ip in ips_to_remove:
+            return "→ WILL BE UNBLOCKED (expired)"
+
+        if ip in final_blocked_ips:
+            return "NO CHANGE (blocked)"
+
+        if ip in skipped_ip_details:
+            score, _ = skipped_ip_details[ip]
+            return f"SKIPPED (score={score:.0f})"
+
+        if hits < self.threshold:
+            return f"BELOW THRESHOLD ({hits}<{self.threshold})"
+
+        return "NOT BLOCKED"
+
+    def _get_live_run_status(
+        self,
+        ip: str,
+        final_blocked_ips: Set[str],
+        offenders: Set[str],
+        hits: int,
+    ) -> str:
+        """Determine display status for live-run mode."""
+
+        if ip in self.whitelist:
+            return "WHITELISTED"
+
+        if is_aws_ip_fast(ip, self.aws_ip_index):
+            return "AWS IP (excluded)"
+
+        if ip in final_blocked_ips:
+            return "ACTIVE BLOCK"
+
+        if ip in offenders:
+            return "SHOULD BE BLOCKED (slot full?)"
+
+        if hits < self.threshold:
+            return "BELOW THRESHOLD"
+
+        return "NOT BLOCKED"
 
 
 if __name__ == "__main__":
@@ -3796,6 +4749,12 @@ Example Live Run (scans a specific pattern, provides a whitelist):
         "--aws-ip-ranges-file",
         default="ip-ranges.json",
         help="Path to AWS ip-ranges.json file. If provided, automatically excludes all AWS IPs from blocking.",
+    )
+    parser.add_argument(
+        "--no-auto-download-ip-ranges",
+        action="store_true",
+        help="Disable automatic download of AWS IP ranges file. Use for air-gapped environments. "
+        "If disabled and file is missing, AWS IP exclusion will be unavailable.",
     )
     parser.add_argument(
         "--live-run",
@@ -4074,5 +5033,7 @@ Example Live Run (scans a specific pattern, provides a whitelist):
         athena_enabled=args.athena,
         athena_database=args.athena_database,
         athena_output_location=args.athena_output_location,
+        # Auto-download AWS IP ranges
+        auto_download_ip_ranges=not args.no_auto_download_ip_ranges,
     )
     blocker.run()
